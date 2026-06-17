@@ -72,12 +72,29 @@ def build_parser() -> argparse.ArgumentParser:
         default="manual",
         help="Where the marker came from (default: manual).",
     )
+    p_mark.add_argument(
+        "--note",
+        default="",
+        help="Optional free-text note for this marker.",
+    )
     p_mark.set_defaults(func=cmd_mark)
 
     # end
     p_end = sub.add_parser("end", help="Stop recording and close the session.")
     _add_root_arg(p_end)
     p_end.set_defaults(func=cmd_end)
+
+    # status
+    p_status = sub.add_parser(
+        "status", help="Show a summary of a session (active by default)."
+    )
+    _add_root_arg(p_status)
+    p_status.add_argument(
+        "--session",
+        default=None,
+        help="Path to a specific session folder (defaults to the active session).",
+    )
+    p_status.set_defaults(func=cmd_status)
 
     return parser
 
@@ -114,11 +131,16 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def cmd_mark(args: argparse.Namespace) -> int:
     session = session_mod.get_active_session(Path(args.sessions_root))
-    marker = session_mod.add_marker(session, args.label, source=args.source)
-    print(
+    marker = session_mod.add_marker(
+        session, args.label, source=args.source, note=args.note
+    )
+    line = (
         f"Marker #{marker.marker_index} @ {marker.elapsed_seconds:.3f}s "
         f"[{marker.source}] {marker.label}"
     )
+    if marker.note:
+        line += f" -- {marker.note}"
+    print(line)
     return 0
 
 
@@ -129,6 +151,28 @@ def cmd_end(args: argparse.Namespace) -> int:
     session_mod.end_session(session)
     print(f"Ended session {session.session_id}.")
     print(f"  markers: {session.markers_file}")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    if args.session:
+        session = session_mod.load_session(Path(args.session))
+    else:
+        session = session_mod.get_active_session(Path(args.sessions_root))
+
+    count = session_mod.marker_count(session)
+    print(f"session:    {session.storage_path}")
+    print(f"session_id: {session.session_id}")
+    print(f"status:     {session.status}")
+    print(f"recorder:   {session.recorder}")
+    print(f"profile:    {session.profile}")
+    print(f"created:    {session.created_wall_time}")
+    if session.started_wall_time:
+        print(f"started:    {session.started_wall_time}")
+    if session.ended_wall_time:
+        print(f"ended:      {session.ended_wall_time}")
+    print(f"markers:    {count}")
+    print(f"notes:      {session.notes_file}")
     return 0
 
 

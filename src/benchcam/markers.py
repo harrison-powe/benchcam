@@ -11,6 +11,7 @@ CSV columns:
 - wall_time       ISO 8601 local timestamp of the marker
 - source          where the marker came from (e.g. "manual", "external")
 - label           free-text description
+- note            optional free-text note (empty string when omitted)
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ FIELDNAMES = [
     "wall_time",
     "source",
     "label",
+    "note",
 ]
 
 
@@ -37,6 +39,7 @@ class Marker:
     wall_time: str
     source: str
     label: str
+    note: str = ""
 
     def as_row(self) -> dict:
         return {
@@ -45,6 +48,7 @@ class Marker:
             "wall_time": self.wall_time,
             "source": self.source,
             "label": self.label,
+            "note": self.note,
         }
 
 

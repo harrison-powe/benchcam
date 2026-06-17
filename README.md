@@ -62,10 +62,36 @@ benchcam run
 # Log markers as you work (quote labels that contain spaces)
 benchcam mark "power on"
 benchcam mark "chip lifted"
-benchcam mark "fault observed"
+
+# Markers can carry an optional note for extra context
+benchcam mark "first motion" --note "actuator moved after wiring fix"
+
+# Check on the active session at any time
+benchcam status
 
 # Close the session
 benchcam end
+```
+
+`benchcam status` prints a concise summary of the active session:
+
+```text
+session:    sessions\2026-06-17_05-43-00
+session_id: 2026-06-17_05-43-00
+status:     running
+recorder:   null
+profile:    bench-a
+created:    2026-06-17T05:43:00.123456+00:00
+started:    2026-06-17T05:43:10.000000+00:00
+markers:    3
+notes:      sessions\2026-06-17_05-43-00\notes.md
+```
+
+You can also inspect a specific session folder (handy after it has ended, since
+`benchcam end` clears the active pointer):
+
+```powershell
+benchcam status --session sessions\2026-06-17_05-43-00
 ```
 
 This produces a folder like:
@@ -98,14 +124,15 @@ sessions\2026-06-17_05-43-00\
 ### markers.csv
 
 ```csv
-marker_index,elapsed_seconds,wall_time,source,label
-1,2.500,2026-06-17T05:43:12.500000+00:00,manual,power on
-2,15.250,2026-06-17T05:43:25.250000+00:00,manual,chip lifted
+marker_index,elapsed_seconds,wall_time,source,label,note
+1,2.500,2026-06-17T05:43:12.500000+00:00,manual,power on,
+2,15.250,2026-06-17T05:43:25.250000+00:00,manual,first motion,actuator moved after wiring fix
 ```
 
 - `elapsed_seconds` is measured from when you ran `benchcam run`.
 - `source` is `manual` for `benchcam mark`; a future external feed can use other
   sources.
+- `note` is an optional free-text note (empty string when omitted).
 
 ### notes.md
 
@@ -119,15 +146,22 @@ A free-form Markdown file for whatever you want to jot down during the session.
 | `benchcam run` | Start recording / start the session clock. |
 | `benchcam mark "label"` | Append a time-stamped marker to the active session. |
 | `benchcam end` | Stop recording and close the active session. |
+| `benchcam status` | Print a summary of the active session (or `--session PATH`). |
 
 Useful options:
 
 - `benchcam new --profile NAME --camera DESC --microphone DESC --recorder {null,obs,ffmpeg} --notes "..."`
-- `benchcam mark "label" --source external`
+- `benchcam mark "label" --source external --note "extra context"`
+- `benchcam status --session sessions\2026-06-17_05-43-00`
 - `--sessions-root PATH` (on any command) to use a different sessions directory.
 
-The "active" session is tracked by a small pointer file at
-`sessions\.active`, so `run`, `mark`, and `end` know which session to use.
+The "active" session is tracked by a small pointer file at `sessions\.active`,
+so `run`, `mark`, `end`, and `status` know which session to use. `benchcam end`
+clears that pointer once the session is closed, so a fresh `benchcam status`
+with no `--session` reports that there is no active session. The full format is
+documented in [docs/session-format.md](docs/session-format.md), and a small
+hand-inspectable example lives in
+[examples/example_session/](examples/example_session/).
 
 ## Recorders
 

@@ -36,6 +36,38 @@ def test_add_marker_appends_rows(tmp_path):
     assert int(rows[1]["marker_index"]) == 2
 
 
+def test_markers_header_includes_note_column(tmp_path):
+    root = tmp_path / "sessions"
+    session = session_mod.create_session(root=root)
+    with session.markers_file.open(encoding="utf-8") as fh:
+        header = next(csv.reader(fh))
+    assert header[-1] == "note"
+    assert header == FIELDNAMES
+
+
+def test_add_marker_without_note_defaults_empty(tmp_path):
+    root = tmp_path / "sessions"
+    session = session_mod.create_session(root=root)
+    marker = session_mod.add_marker(session, "no note here")
+    assert marker.note == ""
+
+    rows = read_markers(session.markers_file)
+    assert rows[0]["note"] == ""
+
+
+def test_add_marker_with_note_is_persisted(tmp_path):
+    root = tmp_path / "sessions"
+    session = session_mod.create_session(root=root)
+    marker = session_mod.add_marker(
+        session, "first motion", note="actuator moved after wiring fix"
+    )
+    assert marker.note == "actuator moved after wiring fix"
+
+    rows = read_markers(session.markers_file)
+    assert rows[0]["label"] == "first motion"
+    assert rows[0]["note"] == "actuator moved after wiring fix"
+
+
 def test_marker_elapsed_is_non_negative_and_numeric(tmp_path):
     root = tmp_path / "sessions"
     session = session_mod.create_session(root=root)

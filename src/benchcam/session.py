@@ -25,6 +25,7 @@ from .markers import (
     append_marker,
     init_markers_file,
     next_marker_index,
+    read_markers,
 )
 
 DEFAULT_SESSIONS_ROOT = Path("sessions")
@@ -168,6 +169,22 @@ def set_active_session(root: Path, folder_name: str) -> None:
     _active_pointer(root).write_text(folder_name + "\n", encoding="utf-8")
 
 
+def active_session_name(root: Path = DEFAULT_SESSIONS_ROOT) -> str | None:
+    """Return the active session folder name, or None if there is none."""
+    pointer = _active_pointer(Path(root))
+    if not pointer.exists():
+        return None
+    name = pointer.read_text(encoding="utf-8").strip()
+    return name or None
+
+
+def clear_active_session(root: Path = DEFAULT_SESSIONS_ROOT) -> None:
+    """Remove the active-session pointer if it exists."""
+    pointer = _active_pointer(Path(root))
+    if pointer.exists():
+        pointer.unlink()
+
+
 def get_active_session(root: Path = DEFAULT_SESSIONS_ROOT) -> Session:
     """Load the active session, or raise SessionError if there is none."""
     root = Path(root)
@@ -198,12 +215,21 @@ def start_session(session: Session) -> Session:
 
 
 def end_session(session: Session) -> Session:
-    """Mark a session as ended and stamp its end time."""
+    """Mark a session as ended and stamp its end time.
+
+    Also clears the active-session pointer when the ended session is the
+    active one, so a fresh ``benchcam status`` does not point at a closed
+    session.
+    """
     if session.status == STATUS_ENDED:
         raise SessionError(f"Session {session.session_id} has already ended.")
     session.status = STATUS_ENDED
     session.ended_wall_time = clock.to_iso(clock.now())
     session.save()
+
+    root = session.folder.parent
+    if active_session_name(root) == session.folder.name:
+        clear_active_session(root)
     return session
 
 
@@ -212,7 +238,13 @@ def _elapsed_baseline(session: Session) -> str:
     return session.started_wall_time or session.created_wall_time
 
 
-def add_marker(session: Session, label: str, *, source: str = "manual") -> Marker:
+def add_marker(
+    session: Session,
+    label: str,
+    *,
+    source: str = "manual",
+    note: str = "",
+) -> Marker:
     """Append a marker to the session and return it."""
     now = clock.now()
     baseline = clock.from_iso(_elapsed_baseline(session))
@@ -224,6 +256,12 @@ def add_marker(session: Session, label: str, *, source: str = "manual") -> Marke
         wall_time=clock.to_iso(now),
         source=source,
         label=label,
+        note=note,
     )
     append_marker(session.markers_file, marker)
     return marker
+
+
+def marker_count(session: Session) -> int:
+    """Return the number of markers logged for the session."""
+    return len(read_markers(session.markers_file))
