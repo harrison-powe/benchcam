@@ -1,6 +1,6 @@
 # BenchCam
 
-Catching actuators in the act.
+catching actuators in the act
 
 BenchCam is a **local-first**, bench-side capture and marker logging tool for
 hardware work. You start a session, log time-stamped markers as you work, and
