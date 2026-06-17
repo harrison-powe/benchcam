@@ -17,7 +17,9 @@ import sys
 from pathlib import Path
 
 from . import __version__
+from . import artifacts as artifacts_mod
 from . import session as session_mod
+from .artifacts import ArtifactError
 from .inputs.keyboard_input import run_interactive_loop
 from .recorders import get_recorder
 from .recorders.base import RecorderError
@@ -102,6 +104,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_status.set_defaults(func=cmd_status)
 
+    # attach-media
+    p_attach = sub.add_parser(
+        "attach-media",
+        help="Attach an externally recorded media file to a session.",
+    )
+    _add_root_arg(p_attach)
+    p_attach.add_argument("file_path", help="Path to the media file to attach.")
+    p_attach.add_argument(
+        "--session",
+        default=None,
+        help="Path to a specific session folder (defaults to the active session).",
+    )
+    p_attach.add_argument("--label", default="", help="Optional label for the media.")
+    p_attach.add_argument(
+        "--kind",
+        default=None,
+        choices=list(artifacts_mod.KINDS),
+        help="Media kind (inferred from the extension when omitted).",
+    )
+    p_attach.add_argument(
+        "--mode",
+        default=artifacts_mod.MODE_COPY,
+        choices=list(artifacts_mod.MODES),
+        help="copy into the session (default) or reference in place.",
+    )
+    p_attach.set_defaults(func=cmd_attach_media)
+
     return parser
 
 
@@ -182,12 +211,35 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_attach_media(args: argparse.Namespace) -> int:
+    if args.session:
+        session = session_mod.load_session(Path(args.session))
+    else:
+        session = session_mod.get_active_session(Path(args.sessions_root))
+
+    artifact = artifacts_mod.attach_media(
+        session,
+        Path(args.file_path),
+        label=args.label,
+        kind=args.kind,
+        mode=args.mode,
+    )
+    print(f"Attached media to session {session.session_id} ({artifact.mode}).")
+    print(f"  session: {session.storage_path}")
+    if artifact.mode == artifacts_mod.MODE_COPY:
+        print(f"  stored:  {session.folder / artifact.stored_path}")
+    else:
+        print(f"  referenced: {artifact.original_path}")
+    print(f"  manifest: {session.artifacts_file}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except (SessionError, RecorderError) as exc:
+    except (SessionError, RecorderError, ArtifactError) as exc:
         print(f"benchcam: {exc}", file=sys.stderr)
         return 1
 

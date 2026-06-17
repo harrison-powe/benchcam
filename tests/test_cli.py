@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from benchcam import artifacts as artifacts_mod
 from benchcam import session as session_mod
 from benchcam.cli import main
 from benchcam.markers import read_markers
@@ -163,6 +164,91 @@ def test_run_interactive_no_active_session(tmp_path, capsys):
     assert rc == 1
     err = capsys.readouterr().err
     assert "No active session" in err
+
+
+def test_attach_media_copy_active_session(tmp_path, capsys):
+    root = str(tmp_path / "sessions")
+    assert main(["new", "--sessions-root", root]) == 0
+
+    src = tmp_path / "obs-recording.mp4"
+    src.write_bytes(b"video bytes")
+
+    rc = main(["attach-media", str(src), "--sessions-root", root, "--label", "main OBS recording"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Attached media" in out
+
+    session = session_mod.get_active_session(tmp_path / "sessions")
+    assert (session.media_dir / "obs-recording.mp4").exists()
+    rows = artifacts_mod.read_artifacts(session.artifacts_file)
+    assert rows[0]["label"] == "main OBS recording"
+    assert rows[0]["stored_path"] == "media/obs-recording.mp4"
+    assert rows[0]["mode"] == "copy"
+
+
+def test_attach_media_reference_mode(tmp_path):
+    root = str(tmp_path / "sessions")
+    assert main(["new", "--sessions-root", root]) == 0
+
+    src = tmp_path / "big.mkv"
+    src.write_bytes(b"x" * 100)
+
+    rc = main(["attach-media", str(src), "--sessions-root", root, "--mode", "reference"])
+    assert rc == 0
+
+    session = session_mod.get_active_session(tmp_path / "sessions")
+    assert list(session.media_dir.iterdir()) == []
+    rows = artifacts_mod.read_artifacts(session.artifacts_file)
+    assert rows[0]["mode"] == "reference"
+    assert rows[0]["stored_path"] == ""
+
+
+def test_attach_media_explicit_session(tmp_path):
+    root = str(tmp_path / "sessions")
+    # Create two sessions; the second becomes active.
+    assert main(["new", "--sessions-root", root]) == 0
+    first = session_mod.get_active_session(tmp_path / "sessions")
+    assert main(["new", "--sessions-root", root]) == 0
+
+    src = tmp_path / "clip.mov"
+    src.write_bytes(b"data")
+
+    rc = main(["attach-media", str(src), "--session", first.storage_path])
+    assert rc == 0
+
+    rows = artifacts_mod.read_artifacts(first.artifacts_file)
+    assert len(rows) == 1
+    assert rows[0]["kind"] == "video"
+
+
+def test_attach_media_no_active_session(tmp_path, capsys):
+    root = str(tmp_path / "sessions")
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(b"data")
+    rc = main(["attach-media", str(src), "--sessions-root", root])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "No active session" in err
+
+
+def test_attach_media_missing_file(tmp_path, capsys):
+    root = str(tmp_path / "sessions")
+    assert main(["new", "--sessions-root", root]) == 0
+    rc = main(["attach-media", str(tmp_path / "nope.mp4"), "--sessions-root", root])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "does not exist" in err
+
+
+def test_attach_media_directory_source(tmp_path, capsys):
+    root = str(tmp_path / "sessions")
+    assert main(["new", "--sessions-root", root]) == 0
+    d = tmp_path / "adir"
+    d.mkdir()
+    rc = main(["attach-media", str(d), "--sessions-root", root])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "directory" in err.lower()
 
 
 def test_end_clears_active_session(tmp_path, capsys):

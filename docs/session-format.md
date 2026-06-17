@@ -18,6 +18,8 @@ sessions/
         session.json              session metadata
         markers.csv               time-stamped markers
         notes.md                  free-form operator notes
+        artifacts.csv             manifest of attached media
+        media/                    media copied into the session (copy mode)
 ```
 
 The folder name is the session's local creation time formatted as
@@ -93,6 +95,46 @@ timestamped line per note in this simple format:
 ```markdown
 - [2026-06-17T12:34:56-07:00] swapped encoder cable before retry
 ```
+
+## artifacts.csv
+
+A manifest of media files attached to the session via `benchcam attach-media`.
+BenchCam does not capture video in v0; you record manually (OBS, webcam, phone,
+audio recorder) and attach the result. Standard CSV with a header row, UTF-8.
+
+Exact header:
+
+```
+artifact_index,added_wall_time,kind,label,original_path,stored_path,size_bytes,mode
+```
+
+| Column | Description |
+| --- | --- |
+| `artifact_index` | 1-based index, increasing within the session. |
+| `added_wall_time` | ISO 8601 local timestamp the file was attached. |
+| `kind` | `video`, `audio`, `image`, or `other`. |
+| `label` | Optional user label; empty string when omitted. |
+| `original_path` | Absolute, resolved path of the source file. |
+| `stored_path` | For copy mode, path relative to the session folder (e.g. `media/clip.mp4`); empty for reference mode. |
+| `size_bytes` | Size of the source file in bytes. |
+| `mode` | `copy` or `reference`. |
+
+### media/ and copy vs reference
+
+- **copy** (default): the source file is copied into `media/`, preserving its
+  filename. If that name already exists, a suffix is appended (`clip.mp4`,
+  `clip-1.mp4`, `clip-2.mp4`, ...) so nothing is overwritten. The original
+  source file is never modified or deleted.
+- **reference**: nothing is copied. Only a manifest row is written, with the
+  `original_path` and an empty `stored_path`. Useful for very large files that
+  should stay where the recorder wrote them.
+
+`kind` is inferred from the file extension (case-insensitive) when `--kind` is
+omitted: `.mp4/.mov/.mkv/.avi/.webm` → video, `.wav/.mp3/.m4a/.flac` → audio,
+`.jpg/.jpeg/.png/.webp` → image, everything else → other.
+
+Both `artifacts.csv` and `media/` are created for new sessions, and are created
+lazily by `attach-media` for older sessions that predate this feature.
 
 ## sessions/.active
 

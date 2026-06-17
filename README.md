@@ -126,6 +126,33 @@ This is **line-based terminal input** for v0 (type a command, press Enter). It i
 not physical GPIO buttons or hotkeys yet — that comes with later Raspberry Pi
 support. BenchCam only logs the events; it never drives moving hardware.
 
+### Attaching media recorded elsewhere
+
+BenchCam does not capture video in v0. Record manually (OBS, a webcam app, your
+phone, an audio recorder, ...) and then attach the file to the session:
+
+```powershell
+benchcam new
+benchcam run --interactive
+# ...record manually in OBS if desired, log markers/notes...
+end
+benchcam attach-media "C:/path/to/obs-recording.mp4" --label "main OBS recording"
+```
+
+- **Copy mode is the default**: the file is copied into `<session>\media\` and a
+  row is added to `<session>\artifacts.csv`. Copy mode never overwrites an
+  existing file — it appends `-1`, `-2`, ... to the name if needed.
+- **Reference mode** (`--mode reference`) avoids copying large files; it records
+  the original path in `artifacts.csv` and leaves the file wherever it is (handy
+  for big OBS recordings). The original source file is never modified or deleted.
+- The kind (`video`/`audio`/`image`/`other`) is inferred from the extension, or
+  set it explicitly with `--kind`.
+- Attach to a specific session with `--session <path>` (works even after the
+  session has ended).
+
+Media lives under the git-ignored `sessions\` directory and **must not be
+committed**.
+
 This produces a folder like:
 
 ```
@@ -179,12 +206,14 @@ A free-form Markdown file for whatever you want to jot down during the session.
 | `benchcam mark "label"` | Append a time-stamped marker to the active session. |
 | `benchcam end` | Stop recording and close the active session. |
 | `benchcam status` | Print a summary of the active session (or `--session PATH`). |
+| `benchcam attach-media <file>` | Attach an externally recorded file to a session (copy by default). |
 
 Useful options:
 
 - `benchcam new --profile NAME --camera DESC --microphone DESC --recorder {null,obs,ffmpeg} --notes "..."`
 - `benchcam mark "label" --source external --note "extra context"`
 - `benchcam status --session sessions\2026-06-17_05-43-00`
+- `benchcam attach-media FILE --label "..." --kind video --mode {copy,reference} --session PATH`
 - `--sessions-root PATH` (on any command) to use a different sessions directory.
 
 The "active" session is tracked by a small pointer file at `sessions\.active`,
@@ -223,9 +252,10 @@ pytest
 
 ```
 src/benchcam/
-    cli.py            argparse CLI (new/run/mark/end)
+    cli.py            argparse CLI (new/run/mark/status/end/attach-media)
     session.py        session model + on-disk layout
     markers.py        markers.csv reading/writing
+    artifacts.py      media attachment + artifacts.csv manifest
     clock.py          time helpers
     recorders/
         base.py       Recorder interface

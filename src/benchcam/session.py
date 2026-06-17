@@ -34,6 +34,8 @@ ACTIVE_POINTER_NAME = ".active"
 SESSION_FILENAME = "session.json"
 MARKERS_FILENAME = "markers.csv"
 NOTES_FILENAME = "notes.md"
+ARTIFACTS_FILENAME = "artifacts.csv"
+MEDIA_DIRNAME = "media"
 
 STATUS_CREATED = "created"
 STATUS_RUNNING = "running"
@@ -75,6 +77,14 @@ class Session:
     @property
     def notes_file(self) -> Path:
         return self.folder / NOTES_FILENAME
+
+    @property
+    def artifacts_file(self) -> Path:
+        return self.folder / ARTIFACTS_FILENAME
+
+    @property
+    def media_dir(self) -> Path:
+        return self.folder / MEDIA_DIRNAME
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -141,6 +151,11 @@ def create_session(
     session.notes_file.write_text(
         f"# Notes for session {session.session_id}\n\n", encoding="utf-8"
     )
+
+    from . import artifacts as artifacts_mod
+
+    session.media_dir.mkdir(parents=True, exist_ok=True)
+    artifacts_mod.init_artifacts_file(session.artifacts_file)
 
     if set_active:
         set_active_session(root, folder.name)
