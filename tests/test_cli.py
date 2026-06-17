@@ -114,6 +114,57 @@ def test_status_no_active_session_handled(tmp_path, capsys):
     assert "No active session" in err
 
 
+def test_run_interactive_full_flow(tmp_path, capsys, monkeypatch):
+    root = str(tmp_path / "sessions")
+    assert main(["new", "--sessions-root", root, "--profile", "bench-a"]) == 0
+
+    lines = iter(
+        [
+            "m first motion | actuator moved after wiring fix",
+            "note swapped encoder cable",
+            "status",
+            "end",
+        ]
+    )
+
+    def fake_input(_prompt=""):
+        try:
+            return next(lines)
+        except StopIteration as exc:
+            raise EOFError from exc
+
+    monkeypatch.setattr("builtins.input", fake_input)
+
+    rc = main(["run", "--interactive", "--sessions-root", root])
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    assert "actuator moved after wiring fix" in out
+    assert "status:" in out
+
+    # Session folder still inspectable after end (active pointer cleared).
+    folders = [p for p in (tmp_path / "sessions").iterdir() if p.is_dir()]
+    assert len(folders) == 1
+    session = session_mod.load_session(folders[0])
+    assert session.status == session_mod.STATUS_ENDED
+
+    rows = read_markers(session.markers_file)
+    assert rows[0]["label"] == "first motion"
+    assert rows[0]["note"] == "actuator moved after wiring fix"
+    assert rows[0]["source"] == "keyboard"
+
+    notes = session.notes_file.read_text(encoding="utf-8")
+    assert "swapped encoder cable" in notes
+
+
+def test_run_interactive_no_active_session(tmp_path, capsys):
+    root = str(tmp_path / "sessions")
+    rc = main(["run", "--interactive", "--sessions-root", root])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "No active session" in err
+
+
 def test_end_clears_active_session(tmp_path, capsys):
     root = str(tmp_path / "sessions")
     assert main(["new", "--sessions-root", root]) == 0

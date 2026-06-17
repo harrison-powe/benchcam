@@ -18,6 +18,7 @@ from pathlib import Path
 
 from . import __version__
 from . import session as session_mod
+from .inputs.keyboard_input import run_interactive_loop
 from .recorders import get_recorder
 from .recorders.base import RecorderError
 from .session import SessionError
@@ -61,6 +62,11 @@ def build_parser() -> argparse.ArgumentParser:
     # run
     p_run = sub.add_parser("run", help="Start recording for the active session.")
     _add_root_arg(p_run)
+    p_run.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Open a line-based prompt to log markers/notes without re-running.",
+    )
     p_run.set_defaults(func=cmd_run)
 
     # mark
@@ -118,14 +124,26 @@ def cmd_new(args: argparse.Namespace) -> int:
 def cmd_run(args: argparse.Namespace) -> int:
     session = session_mod.get_active_session(Path(args.sessions_root))
     recorder = get_recorder(session.recorder)
-    recorder.start(session.folder)
-    session_mod.start_session(session)
-    print(f"Recording session {session.session_id} (recorder: {session.recorder}).")
-    if session.recorder == "null":
+
+    already_running = session.status == session_mod.STATUS_RUNNING
+    if already_running:
+        print(f"Session {session.session_id} is already running.")
+    else:
+        recorder.start(session.folder)
+        session_mod.start_session(session)
         print(
-            "  NullRecorder: no video is being captured. Capture manually if "
-            "needed; markers and timing are still logged."
+            f"Recording session {session.session_id} "
+            f"(recorder: {session.recorder})."
         )
+        if session.recorder == "null":
+            print(
+                "  NullRecorder: no video is being captured. Capture manually if "
+                "needed; markers and timing are still logged."
+            )
+
+    if getattr(args, "interactive", False):
+        run_interactive_loop(session, recorder)
+
     return 0
 
 
@@ -160,19 +178,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     else:
         session = session_mod.get_active_session(Path(args.sessions_root))
 
-    count = session_mod.marker_count(session)
-    print(f"session:    {session.storage_path}")
-    print(f"session_id: {session.session_id}")
-    print(f"status:     {session.status}")
-    print(f"recorder:   {session.recorder}")
-    print(f"profile:    {session.profile}")
-    print(f"created:    {session.created_wall_time}")
-    if session.started_wall_time:
-        print(f"started:    {session.started_wall_time}")
-    if session.ended_wall_time:
-        print(f"ended:      {session.ended_wall_time}")
-    print(f"markers:    {count}")
-    print(f"notes:      {session.notes_file}")
+    print(session_mod.status_summary(session))
     return 0
 
 

@@ -94,6 +94,38 @@ You can also inspect a specific session folder (handy after it has ended, since
 benchcam status --session sessions\2026-06-17_05-43-00
 ```
 
+### Interactive mode (recommended for live bench work)
+
+Running a separate command for every marker is awkward while your hands are
+busy. `benchcam run --interactive` starts the session (if it is not already
+running) and opens a simple line-based prompt so you can log markers and notes
+without leaving the terminal:
+
+```powershell
+benchcam new
+benchcam run --interactive
+m first motion | actuator moved after wiring fix
+note swapped encoder cable
+status
+end
+```
+
+Inside the prompt:
+
+| Input | What it does |
+| --- | --- |
+| `m <label>` | Add a marker (source `keyboard`, empty note). |
+| `m <label> \| <note>` | Add a marker with a note. |
+| `note <text>` | Append a timestamped line to `notes.md`. |
+| `status` | Print the session status summary. |
+| `help` | List the available commands. |
+| `q`, `quit`, or `end` | End the session, stop the recorder, and exit. |
+| (blank line) | Ignored. |
+
+This is **line-based terminal input** for v0 (type a command, press Enter). It is
+not physical GPIO buttons or hotkeys yet — that comes with later Raspberry Pi
+support. BenchCam only logs the events; it never drives moving hardware.
+
 This produces a folder like:
 
 ```
@@ -143,7 +175,7 @@ A free-form Markdown file for whatever you want to jot down during the session.
 | Command | What it does |
 | --- | --- |
 | `benchcam new` | Create a new session folder and make it the active session. |
-| `benchcam run` | Start recording / start the session clock. |
+| `benchcam run` | Start recording / start the session clock. Add `--interactive` for a line-based marker/note prompt. |
 | `benchcam mark "label"` | Append a time-stamped marker to the active session. |
 | `benchcam end` | Stop recording and close the active session. |
 | `benchcam status` | Print a summary of the active session (or `--session PATH`). |
@@ -200,6 +232,8 @@ src/benchcam/
         null.py       NullRecorder (default)
         obs.py        ObsRecorder stub
         ffmpeg.py     FfmpegRecorder stub
+    inputs/
+        keyboard_input.py  line-based interactive marker loop
 tests/                unit tests
 ```
 

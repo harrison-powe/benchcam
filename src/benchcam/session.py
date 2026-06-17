@@ -265,3 +265,35 @@ def add_marker(
 def marker_count(session: Session) -> int:
     """Return the number of markers logged for the session."""
     return len(read_markers(session.markers_file))
+
+
+def append_note(session: Session, text: str) -> str:
+    """Append a single timestamped line to notes.md and return that line.
+
+    The format is ``- [ISO 8601 wall time] text``. Kept deliberately simple:
+    no templates, no front matter, just one line appended per call.
+    """
+    line = f"- [{clock.to_iso(clock.now())}] {text}"
+    with session.notes_file.open("a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+    return line
+
+
+def status_summary(session: Session) -> str:
+    """Render the human-readable status summary used by CLI and interactive mode."""
+    count = marker_count(session)
+    lines = [
+        f"session:    {session.storage_path}",
+        f"session_id: {session.session_id}",
+        f"status:     {session.status}",
+        f"recorder:   {session.recorder}",
+        f"profile:    {session.profile}",
+        f"created:    {session.created_wall_time}",
+    ]
+    if session.started_wall_time:
+        lines.append(f"started:    {session.started_wall_time}")
+    if session.ended_wall_time:
+        lines.append(f"ended:      {session.ended_wall_time}")
+    lines.append(f"markers:    {count}")
+    lines.append(f"notes:      {session.notes_file}")
+    return "\n".join(lines)

@@ -86,7 +86,13 @@ marker_index,elapsed_seconds,wall_time,source,label,note
 ## notes.md
 
 A free-form Markdown file for whatever the operator wants to jot down during the
-session. BenchCam seeds it with a heading and otherwise leaves it to you.
+session. BenchCam seeds it with a heading and otherwise leaves it to you. The
+interactive `note <text>` command (see `benchcam run --interactive`) appends one
+timestamped line per note in this simple format:
+
+```markdown
+- [2026-06-17T12:34:56-07:00] swapped encoder cable before retry
+```
 
 ## sessions/.active
 
