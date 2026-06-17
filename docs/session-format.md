@@ -20,7 +20,20 @@ sessions/
         notes.md                  free-form operator notes
         artifacts.csv             manifest of attached media
         media/                    media copied into the session (copy mode)
+        review.md                 generated review (derived; optional)
 ```
+
+## Source artifacts vs. derived artifacts
+
+The **source artifacts** are the files BenchCam records as you work:
+`session.json`, `markers.csv`, `notes.md`, `artifacts.csv`, and the `media/`
+folder. These are the source of truth.
+
+`review.md` is a **derived artifact**: it is generated on demand by
+`benchcam review` from the source artifacts and can be regenerated or deleted at
+any time without losing data. The exporter is read-only over the source
+artifacts and never processes media — it only reads the manifest. See
+[review.md](#reviewmd) below.
 
 The folder name is the session's local creation time formatted as
 `YYYY-MM-DD_HH-MM-SS`. If two sessions are created in the same second, a numeric
@@ -135,6 +148,26 @@ omitted: `.mp4/.mov/.mkv/.avi/.webm` → video, `.wav/.mp3/.m4a/.flac` → audio
 
 Both `artifacts.csv` and `media/` are created for new sessions, and are created
 lazily by `attach-media` for older sessions that predate this feature.
+
+## review.md
+
+A generated, human-readable Markdown summary produced by `benchcam review`. It
+is a derived artifact (not a source of truth) intended for build logs, debugging
+notes, and proof-of-work packaging. It contains:
+
+- a **Session** section (path, id, status, profile, recorder, camera,
+  microphone, and created/started/ended wall times),
+- a **Markers** table (or `No markers recorded.`),
+- an **Artifacts** table (or `No artifacts attached.`),
+- a **Notes** section with the contents of `notes.md` (or `No notes recorded.`),
+- a static **Review Checklist**.
+
+The output is deterministic: it is built only from session data and does not
+embed the time the review was generated. Table cells are escaped (pipes become
+`\|`, newlines are flattened) so marker labels/notes cannot break the tables.
+By default it is written to `<session>/review.md`; `--output <path>` writes
+elsewhere. Generating a review never modifies the source artifacts and never
+touches media files.
 
 ## sessions/.active
 

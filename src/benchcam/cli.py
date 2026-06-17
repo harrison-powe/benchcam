@@ -19,10 +19,12 @@ from pathlib import Path
 from . import __version__
 from . import artifacts as artifacts_mod
 from . import session as session_mod
+from . import review as review_mod
 from .artifacts import ArtifactError
 from .inputs.keyboard_input import run_interactive_loop
 from .recorders import get_recorder
 from .recorders.base import RecorderError
+from .review import ReviewError
 from .session import SessionError
 
 
@@ -131,6 +133,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_attach.set_defaults(func=cmd_attach_media)
 
+    # review
+    p_review = sub.add_parser(
+        "review", help="Generate a Markdown review (review.md) from a session."
+    )
+    _add_root_arg(p_review)
+    p_review.add_argument(
+        "--session",
+        default=None,
+        help="Path to a specific session folder (defaults to the active session).",
+    )
+    p_review.add_argument(
+        "--output",
+        default=None,
+        help="Write the review to this path (defaults to <session>/review.md).",
+    )
+    p_review.set_defaults(func=cmd_review)
+
     return parser
 
 
@@ -234,12 +253,25 @@ def cmd_attach_media(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_review(args: argparse.Namespace) -> int:
+    if args.session:
+        session = session_mod.load_session(Path(args.session))
+    else:
+        session = session_mod.get_active_session(Path(args.sessions_root))
+
+    output = Path(args.output) if args.output else None
+    out_path = review_mod.write_review(session, output)
+    print(f"Wrote review for session {session.session_id}.")
+    print(f"  review: {out_path}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except (SessionError, RecorderError, ArtifactError) as exc:
+    except (SessionError, RecorderError, ArtifactError, ReviewError) as exc:
         print(f"benchcam: {exc}", file=sys.stderr)
         return 1
 

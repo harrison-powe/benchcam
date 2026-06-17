@@ -251,6 +251,64 @@ def test_attach_media_directory_source(tmp_path, capsys):
     assert "directory" in err.lower()
 
 
+def test_review_active_session(tmp_path, capsys):
+    root = str(tmp_path / "sessions")
+    assert main(["new", "--sessions-root", root]) == 0
+    assert main(["run", "--sessions-root", root]) == 0
+    assert main(["mark", "--sessions-root", root, "first motion"]) == 0
+
+    rc = main(["review", "--sessions-root", root])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Wrote review" in out
+
+    session = session_mod.get_active_session(tmp_path / "sessions")
+    review_path = session.folder / "review.md"
+    assert review_path.exists()
+    text = review_path.read_text(encoding="utf-8")
+    assert "# BenchCam Session Review" in text
+    assert "first motion" in text
+
+
+def test_review_explicit_session(tmp_path):
+    root = str(tmp_path / "sessions")
+    assert main(["new", "--sessions-root", root]) == 0
+    first = session_mod.get_active_session(tmp_path / "sessions")
+    # Make a second active session; review should still target the explicit one.
+    assert main(["new", "--sessions-root", root]) == 0
+
+    rc = main(["review", "--session", first.storage_path])
+    assert rc == 0
+    assert (first.folder / "review.md").exists()
+
+
+def test_review_custom_output(tmp_path):
+    root = str(tmp_path / "sessions")
+    assert main(["new", "--sessions-root", root]) == 0
+    session = session_mod.get_active_session(tmp_path / "sessions")
+    target = tmp_path / "out" / "my-review.md"
+
+    rc = main(["review", "--sessions-root", root, "--output", str(target)])
+    assert rc == 0
+    assert target.exists()
+    assert not (session.folder / "review.md").exists()
+
+
+def test_review_no_active_session(tmp_path, capsys):
+    root = str(tmp_path / "sessions")
+    rc = main(["review", "--sessions-root", root])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "No active session" in err
+
+
+def test_review_invalid_session_path(tmp_path, capsys):
+    rc = main(["review", "--session", str(tmp_path / "nope")])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "No session.json" in err
+
+
 def test_end_clears_active_session(tmp_path, capsys):
     root = str(tmp_path / "sessions")
     assert main(["new", "--sessions-root", root]) == 0

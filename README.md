@@ -153,6 +153,33 @@ benchcam attach-media "C:/path/to/obs-recording.mp4" --label "main OBS recording
 Media lives under the git-ignored `sessions\` directory and **must not be
 committed**.
 
+### Exporting a review
+
+`benchcam review` turns a session's local artifacts into a single
+human-readable `review.md`, handy for build logs, debugging notes, and
+proof-of-work packaging:
+
+```powershell
+benchcam new
+benchcam run --interactive
+m first motion | actuator moved after wiring fix
+note swapped encoder cable
+end
+benchcam attach-media "C:/path/to/obs-recording.mp4" --label "main OBS recording"
+benchcam review
+```
+
+- `review.md` is generated **from local session artifacts** (`session.json`,
+  `markers.csv`, `artifacts.csv`, `notes.md`) and is written to
+  `<session>\review.md` by default.
+- It **does not process video** or any media — it only reads the manifest. No AI
+  summarization, transcripts, or clipping.
+- It is intended for **build-log / debugging review**: session metadata, a marker
+  table, an artifact table, your notes, and a short review checklist.
+- Target a specific session with `--session <path>` (works after the session has
+  ended) or write elsewhere with `--output <path>`.
+- Media files remain outside Git; `review.md` only references them by path.
+
 This produces a folder like:
 
 ```
@@ -207,6 +234,7 @@ A free-form Markdown file for whatever you want to jot down during the session.
 | `benchcam end` | Stop recording and close the active session. |
 | `benchcam status` | Print a summary of the active session (or `--session PATH`). |
 | `benchcam attach-media <file>` | Attach an externally recorded file to a session (copy by default). |
+| `benchcam review` | Generate a Markdown `review.md` summary from a session. |
 
 Useful options:
 
@@ -214,6 +242,7 @@ Useful options:
 - `benchcam mark "label" --source external --note "extra context"`
 - `benchcam status --session sessions\2026-06-17_05-43-00`
 - `benchcam attach-media FILE --label "..." --kind video --mode {copy,reference} --session PATH`
+- `benchcam review --session PATH --output PATH`
 - `--sessions-root PATH` (on any command) to use a different sessions directory.
 
 The "active" session is tracked by a small pointer file at `sessions\.active`,
@@ -256,6 +285,7 @@ src/benchcam/
     session.py        session model + on-disk layout
     markers.py        markers.csv reading/writing
     artifacts.py      media attachment + artifacts.csv manifest
+    review.py         review.md Markdown export
     clock.py          time helpers
     recorders/
         base.py       Recorder interface
