@@ -7,6 +7,7 @@ Commands:
     benchcam live           interactive single-keypress marking shell
     benchcam end            stop recording and close the active session
     benchcam edit           render a marker-aware review.mp4 for a session
+    benchcam dashboard      local web UI: start/mark/stop/review in a browser
 
 Each command is a separate process, so the "active" session is tracked on disk
 via a small pointer file (see session.py). State lives in plain local files.
@@ -20,10 +21,12 @@ import sys
 from pathlib import Path
 
 from . import __version__
+from . import dashboard as dashboard_mod
 from . import editor as editor_mod
 from . import keypress
 from . import live as live_mod
 from . import session as session_mod
+from .dashboard import DashboardError
 from .editor import EditError
 from .recorders import get_recorder
 from .recorders.base import RecorderError
@@ -147,6 +150,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_edit.set_defaults(func=cmd_edit)
 
+    # dashboard
+    p_dash = sub.add_parser(
+        "dashboard",
+        help="Start a local web dashboard (start/mark/stop/review in a browser).",
+    )
+    _add_root_arg(p_dash)
+    p_dash.add_argument(
+        "--host", default=dashboard_mod.DEFAULT_HOST, help="Bind host (default: 127.0.0.1)."
+    )
+    p_dash.add_argument(
+        "--port", type=int, default=dashboard_mod.DEFAULT_PORT,
+        help="Bind port (default: 8765).",
+    )
+    p_dash.add_argument(
+        "--no-browser", action="store_true",
+        help="Do not open a browser window automatically.",
+    )
+    p_dash.set_defaults(func=cmd_dashboard)
+
     return parser
 
 
@@ -225,12 +247,21 @@ def cmd_edit(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    return dashboard_mod.serve(
+        host=args.host,
+        port=args.port,
+        sessions_root=Path(args.sessions_root),
+        open_browser=not args.no_browser,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except (SessionError, RecorderError, EditError) as exc:
+    except (SessionError, RecorderError, EditError, DashboardError) as exc:
         print(f"benchcam: {exc}", file=sys.stderr)
         return 1
 
