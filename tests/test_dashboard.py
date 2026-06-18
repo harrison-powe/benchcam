@@ -318,6 +318,7 @@ def test_is_dashboard_running_detects_serving_and_closed(tmp_path):
 
 
 def test_serve_reuses_running_dashboard_instead_of_starting_a_second(monkeypatch, tmp_path):
+    monkeypatch.setattr(dash, "_open_marker_path", lambda port: tmp_path / "marker")
     monkeypatch.setattr(dash, "is_dashboard_running", lambda *a, **k: True)
     opened = {}
     monkeypatch.setattr(dash.webbrowser, "open", lambda url: opened.setdefault("url", url))
@@ -331,6 +332,53 @@ def test_serve_reuses_running_dashboard_instead_of_starting_a_second(monkeypatch
 
     assert rc == 0
     assert opened["url"] == "http://127.0.0.1:8765/"
+
+
+class _FakeHttpd:
+    def serve_forever(self):
+        return None
+
+    def server_close(self):
+        return None
+
+
+def test_serve_opens_browser_exactly_once_on_fresh_start(monkeypatch, tmp_path):
+    monkeypatch.setattr(dash, "_open_marker_path", lambda port: tmp_path / "marker")
+    monkeypatch.setattr(dash, "is_dashboard_running", lambda *a, **k: False)
+    monkeypatch.setattr(dash, "make_server", lambda *a, **k: (_FakeHttpd(), None))
+    calls = []
+    monkeypatch.setattr(dash.webbrowser, "open", lambda u: calls.append(u))
+
+    rc = dash.serve(host="127.0.0.1", port=9991, sessions_root=tmp_path, open_browser=True)
+
+    assert rc == 0
+    assert len(calls) == 1  # exactly one tab on a fresh start
+
+
+def test_serve_opens_browser_exactly_once_when_already_running(monkeypatch, tmp_path):
+    monkeypatch.setattr(dash, "_open_marker_path", lambda port: tmp_path / "marker")
+    monkeypatch.setattr(dash, "is_dashboard_running", lambda *a, **k: True)
+    calls = []
+    monkeypatch.setattr(dash.webbrowser, "open", lambda u: calls.append(u))
+
+    rc = dash.serve(host="127.0.0.1", port=9992, sessions_root=tmp_path, open_browser=True)
+
+    assert rc == 0
+    assert len(calls) == 1  # exactly one tab when reusing a running server
+
+
+def test_duplicate_launches_open_only_one_tab(monkeypatch, tmp_path):
+    # A launcher that fires twice (or a fresh-start quickly followed by a reuse)
+    # must still result in at most one new tab.
+    monkeypatch.setattr(dash, "_open_marker_path", lambda port: tmp_path / "marker")
+    monkeypatch.setattr(dash, "is_dashboard_running", lambda *a, **k: True)
+    calls = []
+    monkeypatch.setattr(dash.webbrowser, "open", lambda u: calls.append(u))
+
+    dash.serve(host="127.0.0.1", port=9993, sessions_root=tmp_path, open_browser=True)
+    dash.serve(host="127.0.0.1", port=9993, sessions_root=tmp_path, open_browser=True)
+
+    assert len(calls) == 1  # second (rapid) launch is debounced
 
 
 # --------------------------------------------------------------------------- #

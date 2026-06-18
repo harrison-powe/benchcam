@@ -28,6 +28,8 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
+import time
 import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -624,6 +626,49 @@ def is_dashboard_running(
         return False
 
 
+# A single launch must open at most one browser tab. The browser open is
+# debounced across processes via a small marker file so that a launcher firing
+# twice, or a fresh-start launch followed quickly by a reuse launch, can't pile
+# up tabs.
+BROWSER_OPEN_DEBOUNCE_SECONDS = 4.0
+
+
+def _open_marker_path(port: int) -> Path:
+    return Path(tempfile.gettempdir()) / f"benchcam-dashboard-open-{port}.marker"
+
+
+def _opened_recently(port: int, within: float = BROWSER_OPEN_DEBOUNCE_SECONDS) -> bool:
+    try:
+        return (time.time() - _open_marker_path(port).stat().st_mtime) < within
+    except OSError:
+        return False
+
+
+def _record_opened(port: int) -> None:
+    try:
+        _open_marker_path(port).write_text(str(time.time()), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def open_dashboard_once(url: str, port: int) -> bool:
+    """Open the dashboard in the browser exactly once per launch (debounced).
+
+    Returns True if a tab was opened, False if skipped because one was opened
+    very recently (a duplicate/rapid launch). This is the single place the
+    browser is opened, so the launcher and ``benchcam dashboard`` never both
+    trigger a second tab.
+    """
+    if _opened_recently(port):
+        return False
+    _record_opened(port)
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+    return True
+
+
 def serve(
     *,
     host: str = DEFAULT_HOST,
@@ -638,10 +683,7 @@ def serve(
     if is_dashboard_running(host, port):
         print(f"BenchCam dashboard is already running at {url}; opening it.")
         if open_browser:
-            try:
-                webbrowser.open(url)
-            except Exception:
-                pass
+            open_dashboard_once(url, port)
         return 0
 
     try:
@@ -655,10 +697,7 @@ def serve(
     print(f"BenchCam dashboard running at {url}")
     print("Keep this window open. Close it (or press Ctrl+C) to stop the dashboard.")
     if open_browser:
-        try:
-            webbrowser.open(url)
-        except Exception:
-            pass
+        open_dashboard_once(url, port)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
