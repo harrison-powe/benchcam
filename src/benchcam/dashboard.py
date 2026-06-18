@@ -1099,14 +1099,31 @@ async function loadLibrary(){
 function libraryRow(s){
   const tr = document.createElement("tr");
 
-  // name (editable; saves via /api/rename, folder stays put)
+  // name (editable; saves via /api/rename, which RENAMES THE FOLDER on disk to
+  // <original-timestamp>_<new-slug> — there is no label-only path).
   const tdName = document.createElement("td");
   const nm = document.createElement("input");
   nm.className = "nm"; nm.value = s.name; nm.dataset.id = s.session_id;
   nm.title = "session id: " + s.session_id;
   nm.disabled = s.active;  // can't rename the folder of a recording session
-  const saveName = () => api("/api/rename", {session: s.session_id, name: nm.value}).then(loadLibrary);
-  nm.addEventListener("keydown", ev => { if (ev.key === "Enter"){ ev.preventDefault(); saveName(); nm.blur(); }});
+  // Enter and blur can both fire (Enter calls blur), so guard against a second
+  // request that would target the now-renamed (stale) folder. On success we
+  // repoint this row at the NEW session id so Open folder/video + Make review
+  // hit the new folder even if the library refresh is momentarily skipped.
+  let lastSaved = s.name, saving = false;
+  const saveName = async () => {
+    if (saving || nm.value === lastSaved) return;
+    saving = true;
+    const d = await api("/api/rename", {session: s.session_id, name: nm.value});
+    saving = false;
+    if (d.ok) {
+      s.session_id = d.session_id; s.name = d.name;
+      nm.dataset.id = d.session_id; nm.title = "session id: " + d.session_id;
+      lastSaved = d.name;
+    }
+    loadLibrary();
+  };
+  nm.addEventListener("keydown", ev => { if (ev.key === "Enter"){ ev.preventDefault(); nm.blur(); }});
   nm.addEventListener("change", saveName);
   tdName.appendChild(nm);
   if (s.active){ const b = document.createElement("div"); b.className = "hint"; b.textContent = "● recording"; tdName.appendChild(b); }
