@@ -21,6 +21,7 @@ from benchcam import dashboard as dash
 from benchcam import editor as editor_mod
 from benchcam import session as session_mod
 from benchcam.dashboard import DashboardController, DashboardError, make_server
+from benchcam.editor import EditError
 from benchcam.markers import read_markers
 from benchcam.recorders.base import RecorderError
 
@@ -353,6 +354,127 @@ def test_render_page_reflects_saved_password(tmp_path):
     assert 'id="obsPassword"' in ctrl.render_page()  # nothing saved yet
     config_mod.save_config({"obs": {"password": "x"}}, tmp_path)
     assert 'id="obsPassword"' not in ctrl.render_page()  # field hidden once saved
+
+
+# --------------------------------------------------------------------------- #
+# Session library (Feature A/B/C)
+# --------------------------------------------------------------------------- #
+
+def test_start_with_name_creates_named_session(monkeypatch, root):
+    _use_recorder(monkeypatch, FakeRecorder())
+    ctrl = DashboardController(root)
+    ctrl.start("null", "p", name="Cool Run")
+    active = session_mod.get_active_session(root)
+    assert active.name == "Cool Run"
+    assert active.session_id.endswith("_cool-run")
+
+
+def test_library_lists_sessions_newest_first_with_metadata(tmp_path):
+    root = tmp_path / "sessions"
+    # Older session: ended, 1 marker, has capture + review.
+    s1 = session_mod.create_session(root=root, name="first")
+    session_mod.start_session(s1)
+    session_mod.add_marker(s1, "a")
+    session_mod.end_session(s1)
+    (s1.folder / "capture.mp4").write_bytes(b"v")
+    (s1.folder / "review.mp4").write_bytes(b"r")
+    # Newer session: no review, no capture.
+    s2 = session_mod.create_session(root=root, name="second")
+
+    ctrl = DashboardController(root, config_root=tmp_path)
+    lib = ctrl.library()["sessions"]
+
+    assert lib[0]["name"] == "second"  # newest first
+    c1 = next(c for c in lib if c["session_id"] == s1.session_id)
+    assert c1["marker_count"] == 1
+    assert c1["has_review"] is True
+    assert c1["has_video"] is True
+    assert c1["duration_seconds"] >= 0.0
+    c2 = next(c for c in lib if c["session_id"] == s2.session_id)
+    assert c2["has_review"] is False
+    assert c2["has_video"] is False
+
+
+def test_open_video_opens_capture(tmp_path, monkeypatch):
+    root = tmp_path / "sessions"
+    s = session_mod.create_session(root=root)
+    (s.folder / "capture.mp4").write_bytes(b"v")
+    ctrl = DashboardController(root, config_root=tmp_path)
+    opened = {}
+    monkeypatch.setattr(dash, "open_file", lambda p: opened.setdefault("p", str(p)))
+
+    res = ctrl.open_video(s.session_id)
+    assert opened["p"].endswith("capture.mp4")
+    assert res["opened"].endswith("capture.mp4")
+
+
+def test_open_video_without_capture_raises(tmp_path):
+    root = tmp_path / "sessions"
+    s = session_mod.create_session(root=root)
+    ctrl = DashboardController(root, config_root=tmp_path)
+    with pytest.raises(EditError):
+        ctrl.open_video(s.session_id)
+
+
+def test_open_review_existing_and_missing(tmp_path, monkeypatch):
+    root = tmp_path / "sessions"
+    s = session_mod.create_session(root=root)
+    ctrl = DashboardController(root, config_root=tmp_path)
+
+    with pytest.raises(DashboardError):
+        ctrl.open_review(s.session_id)  # none yet
+
+    (s.folder / "review.mp4").write_bytes(b"r")
+    opened = {}
+    monkeypatch.setattr(dash, "open_file", lambda p: opened.setdefault("p", str(p)))
+    res = ctrl.open_review(s.session_id)
+    assert opened["p"].endswith("review.mp4")
+    assert res["opened"].endswith("review.mp4")
+
+
+def test_make_review_for_session_runs_edit_and_opens(tmp_path, monkeypatch):
+    root = tmp_path / "sessions"
+    s = session_mod.create_session(root=root)
+    (s.folder / "capture.mp4").write_bytes(b"v")
+    ctrl = DashboardController(root, config_root=tmp_path)
+
+    captured = {}
+
+    def fake_run_edit(d, **k):
+        captured["dir"] = str(d)
+        return f"{d}/review.mp4"
+
+    monkeypatch.setattr(editor_mod, "run_edit", fake_run_edit)
+    opened = {}
+    monkeypatch.setattr(dash, "open_file", lambda p: opened.setdefault("p", str(p)))
+
+    res = ctrl.make_review(s.session_id, pre=2, post=4, speed=10)
+    assert captured["dir"] == str(s.folder)
+    assert res["review_path"].endswith("review.mp4")
+    assert opened["p"].endswith("review.mp4")
+
+
+def test_rename_sets_name_without_renaming_folder(tmp_path):
+    root = tmp_path / "sessions"
+    s = session_mod.create_session(root=root, name="old")
+    folder = s.folder
+    ctrl = DashboardController(root, config_root=tmp_path)
+
+    res = ctrl.rename(s.session_id, "New Name")
+    assert res["name"] == "New Name"
+    assert folder.exists() and folder.name == s.session_id  # folder unchanged
+    reloaded = session_mod.load_session(folder)
+    assert reloaded.name == "New Name"
+
+
+def test_open_folder_opens_session_dir(tmp_path, monkeypatch):
+    root = tmp_path / "sessions"
+    s = session_mod.create_session(root=root)
+    ctrl = DashboardController(root, config_root=tmp_path)
+    opened = {}
+    monkeypatch.setattr(dash, "open_file", lambda p: opened.setdefault("p", str(p)))
+    ctrl.open_folder(s.session_id)
+    assert opened["p"] == str(s.folder)
 
 
 # --------------------------------------------------------------------------- #

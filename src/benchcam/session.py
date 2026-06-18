@@ -16,6 +16,7 @@ Everything here is local files only. No cloud sync.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -43,6 +44,20 @@ class SessionError(RuntimeError):
     """Raised for session lifecycle / state problems."""
 
 
+def slugify(name: str) -> str:
+    """Turn a friendly name into a filesystem-safe slug.
+
+    Lowercases, turns whitespace into hyphens, drops anything that isn't a-z0-9
+    or hyphen, collapses repeated hyphens, and trims leading/trailing hyphens.
+    Returns "" when nothing usable remains (so the folder stays timestamp-only).
+    """
+    text = (name or "").strip().lower()
+    text = re.sub(r"\s+", "-", text)
+    text = re.sub(r"[^a-z0-9-]", "", text)
+    text = re.sub(r"-{2,}", "-", text).strip("-")
+    return text
+
+
 @dataclass
 class Session:
     """In-memory view of a session's metadata (mirrors session.json)."""
@@ -55,6 +70,7 @@ class Session:
     recorder: str
     storage_path: str
     notes: str = ""
+    name: str = ""
     status: str = STATUS_CREATED
     started_wall_time: str | None = None
     ended_wall_time: str | None = None
@@ -62,6 +78,11 @@ class Session:
     @property
     def folder(self) -> Path:
         return Path(self.storage_path)
+
+    @property
+    def display_name(self) -> str:
+        """Friendly name if set, else the folder name (old sessions)."""
+        return self.name or self.session_id
 
     @property
     def session_file(self) -> Path:
@@ -112,15 +133,23 @@ def create_session(
     microphone: str = "",
     recorder: str = "null",
     notes: str = "",
+    name: str = "",
     set_active: bool = True,
 ) -> Session:
-    """Create a new session folder with its three files and return the Session."""
+    """Create a new session folder with its three files and return the Session.
+
+    When ``name`` is given, the folder is ``<timestamp>_<slug>`` (timestamp kept
+    for sorting/uniqueness); the original human-readable name is stored in
+    session.json. With no name, the folder is timestamp-only as before.
+    """
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
 
     created = clock.now()
-    name = clock.folder_timestamp(created)
-    folder = _unique_folder(root, name)
+    timestamp = clock.folder_timestamp(created)
+    slug = slugify(name)
+    folder_name = f"{timestamp}_{slug}" if slug else timestamp
+    folder = _unique_folder(root, folder_name)
     folder.mkdir(parents=True, exist_ok=False)
 
     session = Session(
@@ -132,6 +161,7 @@ def create_session(
         recorder=recorder,
         storage_path=str(folder),
         notes=notes,
+        name=(name or "").strip(),
         status=STATUS_CREATED,
     )
     session.save()
