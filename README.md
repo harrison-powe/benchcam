@@ -404,6 +404,25 @@ refused; stopping when nothing is active is a no-op with a message.
 With the OBS recorder, **OBS itself is your live camera preview** next to the
 dashboard; BenchCam just drives OBS's record start/stop so markers stay aligned.
 
+### OBS password (no env var needed)
+
+You don't need to set `BENCHCAM_OBS_PASSWORD` before launching. When the OBS
+recorder is selected, the Start screen shows an **OBS WebSocket password** field
+(and optional host/port). Enter the password from OBS's **Tools → WebSocket
+Server Settings → Show Connect Info** once and start a session — BenchCam saves
+it to a **local, git-ignored** file at `.benchcam\config.json` (under the project
+folder), so you won't have to re-enter it on future launches (leave the field
+blank to reuse the saved one). The password resolves in order:
+
+1. the field you typed on the Start screen,
+2. the saved `.benchcam\config.json`,
+3. the `BENCHCAM_OBS_PASSWORD` environment variable,
+
+and if none is available the start fails with the same clear "authentication
+enabled but no password provided" error as the CLI. The `.benchcam\` folder (and
+`.env`) are git-ignored, so the password is never committed. Host/port work the
+same way (defaulting to `localhost:4455`).
+
 ### Desktop shortcut (double-click to launch, no typing)
 
 A launcher is provided at `scripts\benchcam-dashboard.bat` (and a PowerShell
@@ -429,12 +448,13 @@ the dashboard.
 ### Run a full session from the dashboard
 
 1. (OBS recorder) Open OBS with your C920S as a source so you have a live
-   preview, and make sure its WebSocket server is enabled and
-   `BENCHCAM_OBS_PASSWORD` is set (see
+   preview, and make sure its WebSocket server is enabled (see
    [Recording video with OBS](#recording-video-with-obs)).
 2. Double-click the desktop shortcut → the dashboard opens in your browser.
-3. Pick the recorder (OBS by default), optionally type a profile, click
-   **Start session**. The indicator turns red **● RECORDING**.
+3. Pick the recorder (OBS by default), optionally type a profile, and — the
+   first time — paste the OBS WebSocket password into the **OBS WebSocket
+   password** field (it's saved locally afterward). Click **Start session**; the
+   indicator turns red **● RECORDING**.
 4. Work at the bench: click **MARK now** for quick markers, or type a label and
    click **Mark + label**; add free-form notes with the note field. Markers
    appear in the live list with their elapsed time.
@@ -491,6 +511,7 @@ src/benchcam/
     keypress.py       cross-platform single-key reader (msvcrt / termios)
     editor.py         marker-aware auto-edit -> review.mp4 (ffmpeg)
     dashboard.py      local web UI (stdlib http.server) over the existing logic
+    config.py         local gitignored config (.benchcam/config.json; OBS creds)
     clock.py          time helpers
     recorders/
         base.py       Recorder interface
