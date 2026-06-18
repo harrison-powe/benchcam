@@ -8,12 +8,15 @@ No real browser, OBS, or encode is used.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import urllib.request
+from pathlib import Path
 from unittest import mock
 
 import pytest
 
+from benchcam import config as config_mod
 from benchcam import dashboard as dash
 from benchcam import editor as editor_mod
 from benchcam import session as session_mod
@@ -166,6 +169,64 @@ def test_review_without_finished_session_raises(root):
     ctrl = DashboardController(root)
     with pytest.raises(DashboardError):
         ctrl.review()
+
+
+# --------------------------------------------------------------------------- #
+# OBS connection settings (config file)
+# --------------------------------------------------------------------------- #
+
+def test_obs_password_resolves_from_config_when_env_absent(monkeypatch, tmp_path):
+    # No global env var (deleting also makes monkeypatch restore/clean up after).
+    monkeypatch.delenv("BENCHCAM_OBS_PASSWORD", raising=False)
+    monkeypatch.delenv("BENCHCAM_OBS_HOST", raising=False)
+    monkeypatch.delenv("BENCHCAM_OBS_PORT", raising=False)
+    config_mod.save_config({"obs": {"password": "sekret", "port": 4499}}, tmp_path)
+
+    _use_recorder(monkeypatch, FakeRecorder())
+    ctrl = DashboardController(tmp_path / "sessions", config_root=tmp_path)
+    ctrl.start("obs", "p")
+
+    # The saved config password/port are applied where ObsRecorder reads them.
+    assert os.environ["BENCHCAM_OBS_PASSWORD"] == "sekret"
+    assert os.environ["BENCHCAM_OBS_PORT"] == "4499"
+
+
+def test_explicit_password_is_persisted_and_overrides_config(monkeypatch, tmp_path):
+    monkeypatch.delenv("BENCHCAM_OBS_PASSWORD", raising=False)
+    config_mod.save_config({"obs": {"password": "old"}}, tmp_path)
+
+    _use_recorder(monkeypatch, FakeRecorder())
+    ctrl = DashboardController(tmp_path / "sessions", config_root=tmp_path)
+    ctrl.start("obs", "p", obs_password="fresh", obs_host="10.0.0.5", obs_port="4500")
+
+    saved = config_mod.load_config(tmp_path)["obs"]
+    assert saved["password"] == "fresh"
+    assert saved["host"] == "10.0.0.5"
+    assert saved["port"] == 4500
+    assert os.environ["BENCHCAM_OBS_PASSWORD"] == "fresh"
+
+
+def test_get_config_never_returns_password(tmp_path):
+    config_mod.save_config({"obs": {"password": "sekret", "host": "h", "port": 4455}}, tmp_path)
+    ctrl = DashboardController(tmp_path / "sessions", config_root=tmp_path)
+    obs = ctrl.get_config()["config"]["obs"]
+    assert obs["has_password"] is True
+    assert obs["host"] == "h"
+    assert obs["port"] == 4455
+    assert "password" not in obs
+
+
+def test_config_file_location_and_roundtrip(tmp_path):
+    path = config_mod.save_config({"obs": {"password": "x"}}, tmp_path)
+    assert path == tmp_path / ".benchcam" / "config.json"
+    assert config_mod.load_config(tmp_path)["obs"]["password"] == "x"
+
+
+def test_config_dir_is_gitignored():
+    gitignore = (Path(__file__).resolve().parents[1] / ".gitignore").read_text(
+        encoding="utf-8"
+    )
+    assert ".benchcam/" in gitignore
 
 
 # --------------------------------------------------------------------------- #
