@@ -24,10 +24,14 @@ Capture/observe only — never commands moving hardware.
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
 from .base import Recorder, RecorderError
+from .collect import collect_recording
+
+_LOG = logging.getLogger("benchcam.recorders.obs")
 
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 4455
@@ -161,7 +165,8 @@ class ObsRecorder(Recorder):
             response = client.stop_record()
             output_path = getattr(response, "output_path", "") or ""
             if output_path:
-                self._record_output_path(output_path)
+                final_path = self._collect_into_session(output_path)
+                self._record_output_path(final_path)
         except Exception:
             # Tolerate "already stopped" / transient errors so ending a session
             # never crashes. The recording (if any) is still safely in OBS.
@@ -169,6 +174,23 @@ class ObsRecorder(Recorder):
         finally:
             self._safe_disconnect(client)
             self._client = None
+
+    def _collect_into_session(self, output_path: str) -> str:
+        """Move the OBS-recorded file into the session folder, if possible.
+
+        OBS writes to its own folder, so on session end we move the video next to
+        the markers as ``capture<ext>``. Returns the new in-folder path on
+        success, or the original external path if collection is skipped or fails
+        (so a failed collect degrades to a pointer, never to lost video).
+        """
+        if self._storage_path is None:
+            return output_path
+        collected = collect_recording(
+            output_path, self._storage_path, warn=_LOG.warning
+        )
+        if collected is None:
+            return output_path
+        return str(collected)
 
     def _record_output_path(self, path: str) -> None:
         """Persist the OBS output path as a sidecar + a notes.md line.

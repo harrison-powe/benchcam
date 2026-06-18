@@ -13,6 +13,7 @@ via a small pointer file (see session.py). State lives in plain local files.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -25,11 +26,27 @@ from .recorders.base import RecorderError
 from .session import SessionError
 
 
+ENV_SESSIONS_ROOT = "BENCHCAM_SESSIONS_ROOT"
+
+
+def _default_sessions_root() -> str:
+    """Resolve the default sessions root: $BENCHCAM_SESSIONS_ROOT, else ./sessions.
+
+    Lets all data (sessions, markers, and collected OBS videos) live on, e.g., an
+    external SSD by setting the env var once — no per-command flag and no code
+    change. An explicit --sessions-root still wins.
+    """
+    return os.environ.get(ENV_SESSIONS_ROOT) or str(session_mod.DEFAULT_SESSIONS_ROOT)
+
+
 def _add_root_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--sessions-root",
-        default=str(session_mod.DEFAULT_SESSIONS_ROOT),
-        help="Directory that holds session folders (default: ./sessions).",
+        default=_default_sessions_root(),
+        help=(
+            "Directory that holds session folders "
+            "(default: $BENCHCAM_SESSIONS_ROOT or ./sessions)."
+        ),
     )
 
 

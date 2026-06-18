@@ -77,6 +77,27 @@ benchcam mark "fault observed"
 benchcam end
 ```
 
+### Where sessions are stored
+
+By default session folders are created under `.\sessions\` in the current
+directory. To put **all** session data (markers and collected videos) somewhere
+else — for example an external SSD — set the `BENCHCAM_SESSIONS_ROOT`
+environment variable. Every command honors it, so new sessions and the videos
+collected into them land there with no code change and no per-command flag:
+
+```powershell
+# Persist it for your user (new shells pick it up automatically):
+setx BENCHCAM_SESSIONS_ROOT "E:\benchcam-sessions"
+
+# ...or just for the current shell:
+$env:BENCHCAM_SESSIONS_ROOT = "E:\benchcam-sessions"
+```
+
+An explicit `--sessions-root PATH` on any command overrides the env var, which
+overrides the `.\sessions\` default. No drive letter is hardcoded — point it at
+whatever drive you like (the external SSD is the intended home once it's
+available).
+
 ### Fast marking with `benchcam live`
 
 `new`/`run`/`mark`/`end` each run as a separate process, which is fine for
@@ -238,10 +259,19 @@ WebSocket v5. OBS stays your live dashboard (preview, framing, focus) while
 BenchCam tells it when to start and stop. Because BenchCam triggers the start,
 marker `elapsed_seconds` lines up with the OBS video timecode automatically.
 
-Unlike the ffmpeg recorder (which writes `capture.mp4` into the session folder),
-**OBS writes the video to its own configured recording folder.** BenchCam can't
-move that, so on stop it records the path OBS reports into the session folder as
-a pointer: `obs_recording.txt` (and a line appended to `notes.md`).
+**OBS writes the video to its own configured recording folder** (BenchCam can't
+change where OBS records). So when the session ends, BenchCam **collects** that
+video — it *moves* the file into the session folder as `capture.<ext>` (the
+extension is whatever OBS wrote, `.mkv` or `.mp4`), so the video ends up right
+next to `markers.csv` / `session.json` / `notes.md` and each session folder is
+self-contained. The `obs_recording.txt` pointer and a `notes.md` line are updated
+to the new in-folder path.
+
+If the move can't happen (file still locked, drive missing, etc.), the session
+still ends cleanly and the pointer keeps the original OBS path — collection
+degrades to "pointer to the external file", never to lost footage. The move is
+cross-drive safe (it falls back to copy-then-delete), so it works even when OBS
+records on `C:` and your session root is on an external SSD.
 
 > Single-app camera constraint: with the OBS recorder, **OBS owns the camera**
 > and provides the live preview. Do not also run the ffmpeg recorder against the
@@ -288,9 +318,9 @@ quitting `live` (or `benchcam end`) sends `StopRecord`, captures the file path O
 wrote, and disconnects. If OBS is *already* recording when you start, BenchCam
 refuses (so you don't end up with a second, misaligned recording).
 
-After the session, the OBS video path is in
-`sessions\<id>\obs_recording.txt`, and the marker `elapsed_seconds` values map
-directly onto that recording's timecode.
+After the session, the OBS video is `sessions\<id>\capture.mkv` (or `.mp4`) next
+to `markers.csv`, `obs_recording.txt` records its final path, and the marker
+`elapsed_seconds` values map directly onto that recording's timecode.
 
 ### 30-second manual test (Windows 11)
 
@@ -324,9 +354,10 @@ pytest
 ## Data and privacy
 
 - BenchCam writes only to your local `sessions\` directory.
-- Video/media files (including each session's `capture.mp4`) and the `sessions\`
-  directory are **git-ignored** and must not be committed. Video is large —
-  keep recordings on your external SSD, not in git.
+- Video/media files (each session's `capture.mp4`/`capture.mkv`, whether written
+  by ffmpeg or collected from OBS) and the `sessions\` directory are
+  **git-ignored** and must not be committed. Video is large — keep recordings on
+  your external SSD (set `BENCHCAM_SESSIONS_ROOT`), not in git.
 
 ## Project layout
 
@@ -343,6 +374,7 @@ src/benchcam/
         null.py       NullRecorder (default)
         obs.py        ObsRecorder (OBS Studio via OBS WebSocket v5)
         ffmpeg.py     FfmpegRecorder (ffmpeg subprocess; Windows/dshow)
+        collect.py    move an external recording into the session folder
 tests/                unit tests
 ```
 

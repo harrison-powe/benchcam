@@ -9,9 +9,11 @@ forcing the import to fail), so the suite stays green in a stdlib-only env.
 from __future__ import annotations
 
 import sys
+from unittest import mock
 
 import pytest
 
+from benchcam.recorders import collect as collect_mod
 from benchcam.recorders import get_recorder
 from benchcam.recorders.base import RecorderError
 from benchcam.recorders.obs import (
@@ -153,19 +155,63 @@ def test_missing_obsws_python_raises_install_hint(tmp_path, monkeypatch):
 # stop()
 # --------------------------------------------------------------------------- #
 
-def test_stop_sends_stop_record_and_captures_output_path(tmp_path, monkeypatch):
+def test_stop_collects_obs_video_into_session_folder(tmp_path, monkeypatch):
     _clear_obs_env(monkeypatch)
-    client = FakeClient(stop_path="D:\\Recordings\\bench.mkv")
+    # OBS wrote the video to its own folder (outside the session folder).
+    obs_video = tmp_path / "obs_out" / "2026-06-18 bench.mkv"
+    obs_video.parent.mkdir(parents=True)
+    obs_video.write_bytes(b"obs-video-bytes")
+
+    session = tmp_path / "sessions" / "S1"
+    session.mkdir(parents=True)
+
+    client = FakeClient(stop_path=str(obs_video))
     rec = ObsRecorder(client_factory=_factory_for(client))
-    rec.start(tmp_path)
+    rec.start(session)
     rec.stop()
 
     assert "stop_record" in client.calls
     assert "disconnect" in client.calls
-    assert rec.output_path == "D:\\Recordings\\bench.mkv"
 
-    sidecar = (tmp_path / RECORDING_POINTER_FILENAME).read_text(encoding="utf-8")
-    assert "D:\\Recordings\\bench.mkv" in sidecar
+    collected = session / "capture.mkv"
+    assert collected.exists()  # video now lives next to markers.csv
+    assert collected.read_bytes() == b"obs-video-bytes"
+    assert not obs_video.exists()  # moved, not copied
+    assert rec.output_path == str(collected)
+
+    # The sidecar/notes pointer is updated to the in-folder path.
+    sidecar = (session / RECORDING_POINTER_FILENAME).read_text(encoding="utf-8")
+    assert str(collected) in sidecar
+
+
+def test_stop_keeps_original_pointer_when_collect_fails(tmp_path, monkeypatch):
+    _clear_obs_env(monkeypatch)
+    # OBS wrote a real file, but the move into the session folder fails (e.g.
+    # locked / permission). Session end must not crash and must keep the
+    # original external path so footage is never lost.
+    obs_video = tmp_path / "obs_out" / "bench.mkv"
+    obs_video.parent.mkdir(parents=True)
+    obs_video.write_bytes(b"obs-video-bytes")
+
+    session = tmp_path / "sessions" / "S2"
+    session.mkdir(parents=True)
+
+    client = FakeClient(stop_path=str(obs_video))
+    rec = ObsRecorder(client_factory=_factory_for(client))
+    rec.start(session)
+
+    with mock.patch.object(
+        collect_mod.os, "replace", side_effect=OSError("locked")
+    ), mock.patch.object(
+        collect_mod.shutil, "copy2", side_effect=OSError("locked")
+    ):
+        rec.stop()  # must not raise
+
+    assert not (session / "capture.mkv").exists()
+    assert obs_video.exists()  # source preserved -> no data loss
+    assert rec.output_path == str(obs_video)  # degraded to original pointer
+    sidecar = (session / RECORDING_POINTER_FILENAME).read_text(encoding="utf-8")
+    assert str(obs_video) in sidecar
 
 
 def test_stop_tolerates_already_stopped(tmp_path, monkeypatch):
