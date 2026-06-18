@@ -9,6 +9,10 @@ dist/
 venv/
 .pytest_cache/
 
+# BenchCam local config (e.g. saved OBS WebSocket password): never commit
+.benchcam/
+.env
+
 # BenchCam local data: never commit sessions or media
 sessions/
 *.mp4

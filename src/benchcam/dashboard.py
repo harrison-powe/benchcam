@@ -24,17 +24,20 @@ recorder is actually used).
 from __future__ import annotations
 
 import json
+import os
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from . import clock
+from . import config as config_mod
 from . import editor as editor_mod
 from . import session as session_mod
 from .editor import EditError
 from .markers import read_markers
 from .recorders import get_recorder
 from .recorders.base import RecorderError
+from .recorders.obs import ENV_HOST, ENV_PASSWORD, ENV_PORT
 from .session import SessionError
 
 DEFAULT_HOST = "127.0.0.1"
@@ -54,14 +57,36 @@ class DashboardController:
     just like the ``live`` shell keeps the session in memory.
     """
 
-    def __init__(self, sessions_root: Path | str) -> None:
+    def __init__(
+        self,
+        sessions_root: Path | str,
+        config_root: Path | str | None = None,
+    ) -> None:
         self.sessions_root = Path(sessions_root)
+        # Where .benchcam/config.json lives (defaults to the launch directory).
+        self._config_root = Path(config_root) if config_root is not None else Path.cwd()
         self._session: session_mod.Session | None = None
         self._recorder = None
         self._last_session: session_mod.Session | None = None
         self._last_review: str | None = None
 
     # -- queries -------------------------------------------------------------
+    def get_config(self) -> dict:
+        """Return non-secret OBS settings for prefilling the UI.
+
+        The password is never returned — only whether one is saved.
+        """
+        obs = config_mod.load_config(self._config_root).get("obs", {})
+        return {
+            "config": {
+                "obs": {
+                    "host": obs.get("host") or "",
+                    "port": obs.get("port") or "",
+                    "has_password": bool(obs.get("password")),
+                }
+            }
+        }
+
     def status(self) -> dict:
         if self._session is None:
             return {
@@ -86,7 +111,15 @@ class DashboardController:
         }
 
     # -- actions -------------------------------------------------------------
-    def start(self, recorder_name: str = "obs", profile: str = "default") -> dict:
+    def start(
+        self,
+        recorder_name: str = "obs",
+        profile: str = "default",
+        *,
+        obs_password: str | None = None,
+        obs_host: str | None = None,
+        obs_port=None,
+    ) -> dict:
         if self._session is not None:
             raise DashboardError(
                 f"A session ({self._session.session_id}) is already active. "
@@ -94,6 +127,11 @@ class DashboardController:
             )
         recorder_name = (recorder_name or "obs").strip().lower()
         profile = (profile or "default").strip() or "default"
+
+        if recorder_name == "obs":
+            # Resolve + persist the OBS connection settings so the (unchanged)
+            # ObsRecorder picks them up via its normal env resolution.
+            self._prepare_obs_connection(obs_password, obs_host, obs_port)
 
         recorder = get_recorder(recorder_name)
         session = session_mod.create_session(
@@ -165,6 +203,48 @@ class DashboardController:
         return {"review_path": str(output)}
 
     # -- helpers -------------------------------------------------------------
+    def _prepare_obs_connection(self, password, host, port) -> None:
+        """Persist any explicitly-provided OBS settings, then resolve them.
+
+        Resolution order is explicit field -> saved config -> the existing
+        BENCHCAM_OBS_* env vars -> ObsRecorder defaults (and finally ObsRecorder's
+        own clear error if no password is available). Field/config values are
+        applied to this process's env so the unchanged ObsRecorder reads them; an
+        absent field/config leaves any real env var untouched.
+        """
+        cfg = config_mod.load_config(self._config_root)
+        obs = dict(cfg.get("obs", {}))
+
+        changed = False
+        if password:
+            obs["password"] = password
+            changed = True
+        if host:
+            obs["host"] = host
+            changed = True
+        if port not in (None, ""):
+            try:
+                obs["port"] = int(port)
+            except (TypeError, ValueError):
+                pass
+            else:
+                changed = True
+        if changed:
+            cfg["obs"] = obs
+            config_mod.save_config(cfg, self._config_root)
+
+        # Apply field-or-config values to the env (only when present, so a real
+        # BENCHCAM_OBS_PASSWORD still works when nothing is saved).
+        resolved_password = password or obs.get("password")
+        resolved_host = host or obs.get("host")
+        resolved_port = port or obs.get("port")
+        if resolved_password:
+            os.environ[ENV_PASSWORD] = str(resolved_password)
+        if resolved_host:
+            os.environ[ENV_HOST] = str(resolved_host)
+        if resolved_port:
+            os.environ[ENV_PORT] = str(resolved_port)
+
     def _require_active(self) -> session_mod.Session:
         if self._session is None:
             raise DashboardError(
@@ -266,6 +346,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_html(PAGE_HTML)
         elif path == "/api/status":
             self._guard(lambda _: self.controller.status(), {})
+        elif path == "/api/config":
+            self._guard(lambda _: self.controller.get_config(), {})
         else:
             self._send_json({"ok": False, "error": "not found"}, 404)
 
@@ -274,7 +356,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
         payload = self._read_json()
         routes = {
             "/api/start": lambda p: self.controller.start(
-                p.get("recorder", "obs"), p.get("profile", "default")
+                p.get("recorder", "obs"),
+                p.get("profile", "default"),
+                obs_password=p.get("obs_password") or None,
+                obs_host=p.get("obs_host") or None,
+                obs_port=p.get("obs_port") or None,
             ),
             "/api/mark": lambda p: self.controller.mark(p.get("label", "")),
             "/api/note": lambda p: self.controller.note(p.get("text", "")),
@@ -432,7 +518,19 @@ PAGE_HTML = """<!doctype html>
         <input id="profile" placeholder="default" />
       </div>
     </div>
-    <p class="hint">OBS recorder needs OBS Studio running with its WebSocket server enabled.</p>
+    <div id="obsPanel">
+      <p class="hint">OBS recorder needs OBS Studio running with its WebSocket server enabled
+         (Tools &rarr; WebSocket Server Settings).</p>
+      <div class="row">
+        <div style="flex:2">
+          <label for="obsPassword">OBS WebSocket password</label>
+          <input id="obsPassword" type="password" placeholder="enter password" autocomplete="off" />
+        </div>
+        <div><label for="obsHost">Host</label><input id="obsHost" placeholder="localhost" /></div>
+        <div><label for="obsPort">Port</label><input id="obsPort" placeholder="4455" /></div>
+      </div>
+      <p id="obsSaved" class="hint"></p>
+    </div>
     <div style="margin-top:12px"><button id="startBtn" class="big">Start session</button></div>
   </div>
 
@@ -532,11 +630,35 @@ function escapeHtml(t){return t.replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">
 
 async function refresh(){ try { render(await api("/api/status")); } catch(e){} }
 
+function toggleObsPanel(){ $("obsPanel").style.display = ($("recorder").value === "obs") ? "block" : "none"; }
+$("recorder").onchange = toggleObsPanel;
+
+async function loadConfig(){
+  try {
+    const d = await api("/api/config");
+    if (d.ok && d.config && d.config.obs){
+      const o = d.config.obs;
+      if (o.host) $("obsHost").value = o.host;
+      if (o.port) $("obsPort").value = o.port;
+      $("obsSaved").textContent = o.has_password
+        ? "A password is saved locally — leave the field blank to reuse it."
+        : "No password saved yet — enter it once and it will be remembered.";
+    }
+  } catch(e){}
+  toggleObsPanel();
+}
+
 $("startBtn").onclick = async () => {
   $("startBtn").disabled = true;
-  const d = await api("/api/start", {recorder: $("recorder").value, profile: $("profile").value});
+  const body = {recorder: $("recorder").value, profile: $("profile").value};
+  if ($("recorder").value === "obs"){
+    body.obs_password = $("obsPassword").value;
+    body.obs_host = $("obsHost").value;
+    body.obs_port = $("obsPort").value;
+  }
+  const d = await api("/api/start", body);
   $("startBtn").disabled = false;
-  if (d.ok) render(d);
+  if (d.ok) { $("obsPassword").value = ""; render(d); }
 };
 $("markBtn").onclick = async () => { const d = await api("/api/mark", {label: ""}); if (d.ok) render(d); };
 $("markLabelBtn").onclick = async () => {
@@ -561,6 +683,7 @@ $("reviewBtn").onclick = async () => {
   else $("reviewOut").textContent = "";
 };
 
+loadConfig();
 refresh();
 setInterval(refresh, 1000);
 </script>
