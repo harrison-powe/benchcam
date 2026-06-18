@@ -6,6 +6,7 @@ the orchestration is tested with ffmpeg/ffprobe mocked. No real encode runs.
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -15,10 +16,12 @@ from benchcam.editor import (
     EditError,
     Segment,
     build_ffmpeg_edit_command,
+    build_filter_complex,
     build_segment_plan,
     find_capture,
     resolve_session_dir,
 )
+from benchcam.editor import _escape_drawtext, _escape_fontfile
 
 
 def _kinds(plan):
@@ -112,73 +115,110 @@ def test_plan_unlabeled_marker_gets_no_caption():
 
 
 # --------------------------------------------------------------------------- #
-# ffmpeg command / filtergraph
+# drawtext / fontfile escaping (the Windows fix)
 # --------------------------------------------------------------------------- #
 
-def _filter_complex(cmd):
-    return cmd[cmd.index("-filter_complex") + 1]
+def test_escape_fontfile_windows_path():
+    # C:\Windows\Fonts\arial.ttf -> forward slashes, drive colon escaped \\:
+    assert _escape_fontfile(r"C:\Windows\Fonts\arial.ttf") == r"C\\:/Windows/Fonts/arial.ttf"
 
 
-def test_command_builds_segments_speeds_and_concat(tmp_path):
+def test_escape_drawtext_colon():
+    assert _escape_drawtext("it's 3:00") == r"it\'s 3\\:00"
+
+
+def test_escape_drawtext_apostrophe():
+    assert _escape_drawtext("don't") == r"don\'t"
+
+
+def test_escape_drawtext_comma():
+    assert _escape_drawtext("lifted, waited") == r"lifted\, waited"
+
+
+def test_escape_drawtext_backslash():
+    # a single literal backslash -> four (survives both parser levels)
+    assert _escape_drawtext("a\\b") == "a\\\\\\\\b"
+
+
+def test_escape_drawtext_percent():
+    assert _escape_drawtext("50% done") == r"50\% done"
+
+
+# --------------------------------------------------------------------------- #
+# filtergraph construction
+# --------------------------------------------------------------------------- #
+
+def test_filtergraph_builds_segments_speeds_and_concat():
     plan = [
         Segment(0.0, 10.0, normal=False, speed=8.0),
         Segment(10.0, 18.0, normal=True, speed=1.0,
                 captions=[editor_mod.Caption("power on", 0.0, 8.0)]),
     ]
-    out = tmp_path / "review.mp4"
-    cmd = build_ffmpeg_edit_command(
-        tmp_path / "capture.mp4", out, plan, ffmpeg="ffmpeg", has_audio=True
-    )
+    fc = build_filter_complex(plan, fontfile=None, has_audio=True)
 
-    assert cmd[0] == "ffmpeg"
-    assert "-i" in cmd and str(tmp_path / "capture.mp4") in cmd
-    assert "anullsrc=channel_layout=stereo:sample_rate=44100" in cmd
-    assert cmd[-1] == str(out)
-    assert "libx264" in cmd and "aac" in cmd
-    assert cmd[cmd.index("-map") + 1] == "[outv]"
-
-    fc = _filter_complex(cmd)
     # Lapse segment: trimmed and sped up 8x, audio from the silent input.
     assert "[0:v]trim=start=0.000:end=10.000,setpts=(PTS-STARTPTS)/8[v0]" in fc
     assert "[1:a]atrim=start=0:end=1.250,asetpts=PTS-STARTPTS[a0]" in fc  # 10/8
-    # Normal segment: 1x, real audio, caption burned in.
+    # Normal segment: 1x, real audio, caption burned in (literal, expansion off).
     assert "[0:v]trim=start=10.000:end=18.000,setpts=PTS-STARTPTS" in fc
-    assert "drawtext=text='power on'" in fc
+    assert "drawtext=text=power on:expansion=none" in fc
+    assert "enable=between(t\\,0.000\\,8.000)" in fc
     assert "[0:a]atrim=start=10.000:end=18.000,asetpts=PTS-STARTPTS[a1]" in fc
     assert "concat=n=2:v=1:a=1[outv][outa]" in fc
 
 
-def test_command_uses_silent_audio_for_all_segments_when_source_has_no_audio(tmp_path):
+def test_filtergraph_includes_escaped_fontfile_when_given():
+    plan = [
+        Segment(0.0, 8.0, normal=True, speed=1.0,
+                captions=[editor_mod.Caption("power on", 0.0, 8.0)]),
+    ]
+    fc = build_filter_complex(plan, fontfile=r"C:\Windows\Fonts\arial.ttf")
+    assert r"fontfile=C\\:/Windows/Fonts/arial.ttf" in fc
+
+
+def test_filtergraph_silent_audio_for_all_segments_when_source_has_no_audio():
     plan = [
         Segment(0.0, 10.0, normal=False, speed=8.0),
         Segment(10.0, 18.0, normal=True, speed=1.0),
     ]
-    cmd = build_ffmpeg_edit_command(
-        tmp_path / "capture.mp4", tmp_path / "review.mp4", plan, has_audio=False
-    )
-    fc = _filter_complex(cmd)
+    fc = build_filter_complex(plan, has_audio=False)
     assert "[0:a]" not in fc  # never references the source audio
     assert "[1:a]atrim=start=0:end=8.000,asetpts=PTS-STARTPTS[a1]" in fc  # normal, 1x
 
 
-def test_command_no_drawtext_without_labels(tmp_path):
+def test_filtergraph_no_drawtext_without_labels():
     plan = build_segment_plan([(10.0, "")], duration=30.0)
-    cmd = build_ffmpeg_edit_command(tmp_path / "capture.mp4", tmp_path / "r.mp4", plan)
-    assert "drawtext" not in _filter_complex(cmd)
+    fc = build_filter_complex(plan)
+    assert "drawtext" not in fc
 
 
-def test_command_empty_plan_raises(tmp_path):
-    with pytest.raises(EditError):
-        build_ffmpeg_edit_command(tmp_path / "c.mp4", tmp_path / "r.mp4", [])
-
-
-def test_drawtext_escapes_single_quote(tmp_path):
+def test_filtergraph_escapes_tricky_label():
     plan = [
         Segment(0.0, 8.0, normal=True, speed=1.0,
-                captions=[editor_mod.Caption("don't panic", 0.0, 8.0)]),
+                captions=[editor_mod.Caption("it's 3:00", 0.0, 8.0)]),
     ]
-    cmd = build_ffmpeg_edit_command(tmp_path / "c.mp4", tmp_path / "r.mp4", plan)
-    assert r"don'\''t panic" in _filter_complex(cmd)
+    fc = build_filter_complex(plan)
+    assert r"text=it\'s 3\\:00" in fc
+
+
+def test_filtergraph_empty_plan_raises():
+    with pytest.raises(EditError):
+        build_filter_complex([])
+
+
+def test_command_uses_filter_complex_script_and_output(tmp_path):
+    script = tmp_path / "graph.ffscript"
+    cmd = build_ffmpeg_edit_command(
+        tmp_path / "capture.mp4", tmp_path / "review.mp4", script, ffmpeg="ffmpeg"
+    )
+    assert cmd[0] == "ffmpeg"
+    assert str(tmp_path / "capture.mp4") in cmd
+    assert "anullsrc=channel_layout=stereo:sample_rate=44100" in cmd
+    assert cmd[cmd.index("-filter_complex_script") + 1] == str(script)
+    assert "-filter_complex" not in cmd  # uses the script form, not inline
+    assert cmd[cmd.index("-map") + 1] == "[outv]"
+    assert "libx264" in cmd and "aac" in cmd
+    assert cmd[-1] == str(tmp_path / "review.mp4")
 
 
 # --------------------------------------------------------------------------- #
@@ -256,6 +296,10 @@ def test_run_edit_builds_command_and_returns_output(tmp_path, monkeypatch):
 
     def fake_run(cmd):
         captured["cmd"] = cmd
+        # The filtergraph lives in the temp script; read it before run_edit
+        # cleans it up so we can assert on its contents.
+        script = cmd[cmd.index("-filter_complex_script") + 1]
+        captured["graph"] = Path(script).read_text(encoding="utf-8")
         return mock.Mock(returncode=0, stderr="")
 
     monkeypatch.setattr(editor_mod, "run_ffmpeg_command", fake_run)
@@ -264,8 +308,11 @@ def test_run_edit_builds_command_and_returns_output(tmp_path, monkeypatch):
 
     assert output == session.folder / "review.mp4"
     assert captured["cmd"][-1] == str(session.folder / "review.mp4")
-    assert "-filter_complex" in captured["cmd"]
-    assert "drawtext=text='power on'" in _filter_complex(captured["cmd"])
+    assert "-filter_complex_script" in captured["cmd"]
+    assert "drawtext=text=power on:expansion=none" in captured["graph"]
+    # The temp filterscript is cleaned up afterwards (only review.mp4 remains).
+    script_path = captured["cmd"][captured["cmd"].index("-filter_complex_script") + 1]
+    assert not Path(script_path).exists()
 
 
 def test_run_edit_missing_ffmpeg_raises(tmp_path, monkeypatch):
