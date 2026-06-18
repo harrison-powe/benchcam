@@ -1,0 +1,569 @@
+"""Local web dashboard for running a whole BenchCam session without a terminal.
+
+``benchcam dashboard`` starts a tiny stdlib ``http.server`` bound to localhost
+and opens the default browser to a single-page UI. The page calls small JSON
+endpoints that drive the EXISTING BenchCam logic — it does not reimplement
+sessions, markers, recorders, collect, or edit:
+
+    start   -> session.create_session + recorder.start + session.start_session
+    mark    -> session.add_marker
+    note    -> append a line to notes.md
+    stop    -> recorder.stop (collect happens inside the OBS recorder) +
+               session.end_session
+    review  -> editor.run_edit
+
+The dashboard is a launch/start/stop/review + click-to-mark convenience. For
+fast hands-busy marking, ``benchcam live`` in a terminal is still the quickest
+path; the dashboard does not replace it.
+
+Local-only (127.0.0.1), no auth, stdlib only (http.server, json, webbrowser).
+The OBS client stays the isolated optional extra (imported only when the OBS
+recorder is actually used).
+"""
+
+from __future__ import annotations
+
+import json
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+
+from . import clock
+from . import editor as editor_mod
+from . import session as session_mod
+from .editor import EditError
+from .markers import read_markers
+from .recorders import get_recorder
+from .recorders.base import RecorderError
+from .session import SessionError
+
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8765
+RECORDER_CHOICES = ("obs", "ffmpeg", "null")
+
+
+class DashboardError(RuntimeError):
+    """Raised for dashboard-level state problems (e.g. double start)."""
+
+
+class DashboardController:
+    """Holds the in-memory session + recorder and drives the existing logic.
+
+    The recorder instance must persist between start and stop (the OBS websocket
+    connection / ffmpeg subprocess handle), so the dashboard keeps it in memory
+    just like the ``live`` shell keeps the session in memory.
+    """
+
+    def __init__(self, sessions_root: Path | str) -> None:
+        self.sessions_root = Path(sessions_root)
+        self._session: session_mod.Session | None = None
+        self._recorder = None
+        self._last_session: session_mod.Session | None = None
+        self._last_review: str | None = None
+
+    # -- queries -------------------------------------------------------------
+    def status(self) -> dict:
+        if self._session is None:
+            return {
+                "active": False,
+                "marker_count": 0,
+                "markers": [],
+                "elapsed_seconds": 0.0,
+                "last_session": self._summary(self._last_session),
+                "last_review": self._last_review,
+            }
+        session = self._session
+        markers = self._markers(session)
+        return {
+            "active": True,
+            "session_id": session.session_id,
+            "folder": str(session.folder),
+            "recorder": session.recorder,
+            "elapsed_seconds": self._elapsed(session),
+            "marker_count": len(markers),
+            "markers": markers,
+            "last_review": self._last_review,
+        }
+
+    # -- actions -------------------------------------------------------------
+    def start(self, recorder_name: str = "obs", profile: str = "default") -> dict:
+        if self._session is not None:
+            raise DashboardError(
+                f"A session ({self._session.session_id}) is already active. "
+                "Stop it before starting another."
+            )
+        recorder_name = (recorder_name or "obs").strip().lower()
+        profile = (profile or "default").strip() or "default"
+
+        recorder = get_recorder(recorder_name)
+        session = session_mod.create_session(
+            root=self.sessions_root, profile=profile, recorder=recorder_name
+        )
+        # recorder.start may raise (e.g. OBS not running) — surface it loudly and
+        # do not leave a half-started session marked active.
+        recorder.start(session.folder)
+        session_mod.start_session(session)
+
+        self._session = session
+        self._recorder = recorder
+        self._last_review = None
+        return self.status()
+
+    def mark(self, label: str = "") -> dict:
+        session = self._require_active()
+        marker = session_mod.add_marker(session, label or "", source="manual")
+        return {
+            "marker": {
+                "index": marker.marker_index,
+                "elapsed": marker.elapsed_seconds,
+                "label": marker.label,
+            },
+            **self.status(),
+        }
+
+    def note(self, text: str) -> dict:
+        session = self._require_active()
+        line = (text or "").rstrip("\n")
+        with session.notes_file.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+        return {"note_added": line}
+
+    def stop(self) -> dict:
+        if self._session is None:
+            return {
+                "active": False,
+                "stopped": False,
+                "message": "No active session to stop.",
+            }
+        session = self._session
+        recorder = self._recorder
+        try:
+            if recorder is not None:
+                recorder.stop()  # OBS recorder collects the video here
+            session_mod.end_session(session)
+        finally:
+            self._session = None
+            self._recorder = None
+        self._last_session = session
+        return {"active": False, "stopped": True, "summary": self._summary(session)}
+
+    def review(
+        self,
+        pre: float = editor_mod.DEFAULT_PRE,
+        post: float = editor_mod.DEFAULT_POST,
+        speed: float = editor_mod.DEFAULT_SPEED,
+    ) -> dict:
+        target = self._last_session or self._session
+        if target is None:
+            raise DashboardError(
+                "No finished session to review yet. Stop a session first."
+            )
+        output = editor_mod.run_edit(
+            target.folder, pre=pre, post=post, speed=speed, out=lambda _m: None
+        )
+        self._last_review = str(output)
+        return {"review_path": str(output)}
+
+    # -- helpers -------------------------------------------------------------
+    def _require_active(self) -> session_mod.Session:
+        if self._session is None:
+            raise DashboardError(
+                "No active session. Start one before marking or adding notes."
+            )
+        return self._session
+
+    @staticmethod
+    def _markers(session: session_mod.Session) -> list[dict]:
+        markers = []
+        for row in read_markers(session.markers_file):
+            try:
+                markers.append(
+                    {
+                        "index": int(row["marker_index"]),
+                        "elapsed": float(row["elapsed_seconds"]),
+                        "label": row.get("label", ""),
+                    }
+                )
+            except (KeyError, ValueError):
+                continue
+        return markers
+
+    @staticmethod
+    def _elapsed(session: session_mod.Session) -> float:
+        baseline = session.started_wall_time or session.created_wall_time
+        try:
+            return max((clock.now() - clock.from_iso(baseline)).total_seconds(), 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _summary(self, session: session_mod.Session | None) -> dict | None:
+        if session is None:
+            return None
+        duration = 0.0
+        if session.started_wall_time and session.ended_wall_time:
+            try:
+                duration = max(
+                    (
+                        clock.from_iso(session.ended_wall_time)
+                        - clock.from_iso(session.started_wall_time)
+                    ).total_seconds(),
+                    0.0,
+                )
+            except (TypeError, ValueError):
+                duration = 0.0
+        return {
+            "session_id": session.session_id,
+            "folder": str(session.folder),
+            "recorder": session.recorder,
+            "marker_count": len(self._markers(session)),
+            "duration_seconds": duration,
+        }
+
+
+# --------------------------------------------------------------------------- #
+# HTTP layer
+# --------------------------------------------------------------------------- #
+
+class DashboardHandler(BaseHTTPRequestHandler):
+    server_version = "BenchCamDashboard/1.0"
+
+    def log_message(self, *args) -> None:  # keep the console quiet
+        return
+
+    @property
+    def controller(self) -> DashboardController:
+        return self.server.controller  # type: ignore[attr-defined]
+
+    def _send_json(self, payload: dict, code: int = 200) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_html(self, html: str) -> None:
+        body = html.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_json(self) -> dict:
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        if not length:
+            return {}
+        raw = self.rfile.read(length)
+        try:
+            return json.loads(raw or b"{}")
+        except ValueError:
+            return {}
+
+    def do_GET(self) -> None:
+        path = self.path.split("?", 1)[0]
+        if path in ("/", "/index.html"):
+            self._send_html(PAGE_HTML)
+        elif path == "/api/status":
+            self._guard(lambda _: self.controller.status(), {})
+        else:
+            self._send_json({"ok": False, "error": "not found"}, 404)
+
+    def do_POST(self) -> None:
+        path = self.path.split("?", 1)[0]
+        payload = self._read_json()
+        routes = {
+            "/api/start": lambda p: self.controller.start(
+                p.get("recorder", "obs"), p.get("profile", "default")
+            ),
+            "/api/mark": lambda p: self.controller.mark(p.get("label", "")),
+            "/api/note": lambda p: self.controller.note(p.get("text", "")),
+            "/api/stop": lambda p: self.controller.stop(),
+            "/api/review": lambda p: self.controller.review(
+                pre=_as_float(p.get("pre"), editor_mod.DEFAULT_PRE),
+                post=_as_float(p.get("post"), editor_mod.DEFAULT_POST),
+                speed=_as_float(p.get("speed"), editor_mod.DEFAULT_SPEED),
+            ),
+        }
+        handler = routes.get(path)
+        if handler is None:
+            self._send_json({"ok": False, "error": "not found"}, 404)
+            return
+        self._guard(handler, payload)
+
+    def _guard(self, action, payload) -> None:
+        """Run an action, returning {ok:True, ...} or {ok:False, error:...}."""
+        try:
+            result = action(payload)
+            self._send_json({"ok": True, **result})
+        except (DashboardError, SessionError, RecorderError, EditError) as exc:
+            self._send_json({"ok": False, "error": str(exc)})
+        except Exception as exc:  # never crash the dashboard on a bad request
+            self._send_json({"ok": False, "error": f"unexpected error: {exc}"})
+
+
+def _as_float(value, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def make_server(host: str, port: int, sessions_root: Path | str) -> tuple[HTTPServer, DashboardController]:
+    """Create the HTTP server + controller (used by serve() and by tests)."""
+    controller = DashboardController(sessions_root)
+    httpd = HTTPServer((host, port), DashboardHandler)
+    httpd.controller = controller  # type: ignore[attr-defined]
+    return httpd, controller
+
+
+def serve(
+    *,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    sessions_root: Path | str,
+    open_browser: bool = True,
+) -> int:
+    try:
+        httpd, _ = make_server(host, port, sessions_root)
+    except OSError as exc:
+        raise DashboardError(
+            f"Could not start the dashboard on {host}:{port}: {exc}. "
+            "Is another dashboard already running on that port?"
+        ) from exc
+
+    url = f"http://{host}:{port}/"
+    print(f"BenchCam dashboard running at {url}")
+    print("Keep this window open. Close it (or press Ctrl+C) to stop the dashboard.")
+    if open_browser:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopping dashboard.")
+    finally:
+        httpd.server_close()
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# Single-page UI (no external assets)
+# --------------------------------------------------------------------------- #
+
+PAGE_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BenchCam Dashboard</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+         margin: 0; padding: 0 16px 48px; background: #14161a; color: #e7e9ee; }
+  .wrap { max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 20px; font-weight: 600; margin: 18px 0 4px; }
+  .sub { color: #9aa3af; font-size: 13px; margin-bottom: 16px; }
+  .state { display: flex; align-items: center; gap: 12px; padding: 16px 18px;
+           border-radius: 12px; font-size: 20px; font-weight: 700; margin-bottom: 18px;
+           border: 1px solid #2a2f37; }
+  .state .dot { width: 16px; height: 16px; border-radius: 50%; }
+  .state.idle { background: #1b1e24; color: #9aa3af; }
+  .state.idle .dot { background: #6b7280; }
+  .state.rec { background: #2a1416; color: #ff6b6b; }
+  .state.rec .dot { background: #ff3b3b; box-shadow: 0 0 0 0 rgba(255,59,59,.7);
+                    animation: pulse 1.4s infinite; }
+  @keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(255,59,59,.6);}
+                     70%{box-shadow:0 0 0 12px rgba(255,59,59,0);}
+                     100%{box-shadow:0 0 0 0 rgba(255,59,59,0);} }
+  .card { background: #1b1e24; border: 1px solid #2a2f37; border-radius: 12px;
+          padding: 16px; margin-bottom: 16px; }
+  .card h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .05em;
+             color: #9aa3af; margin: 0 0 12px; }
+  label { font-size: 13px; color: #c4c9d2; display: block; margin: 8px 0 4px; }
+  input, select { background: #0f1115; color: #e7e9ee; border: 1px solid #333a44;
+                  border-radius: 8px; padding: 9px 10px; font-size: 14px; width: 100%; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .row > * { flex: 1; min-width: 120px; }
+  button { cursor: pointer; border: none; border-radius: 8px; padding: 11px 14px;
+           font-size: 14px; font-weight: 600; color: #fff; background: #3b82f6; }
+  button.big { padding: 16px; font-size: 18px; width: 100%; }
+  button.mark { background: #16a34a; }
+  button.stop { background: #dc2626; }
+  button.ghost { background: #334155; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .mut { color: #9aa3af; font-size: 13px; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #262b33; }
+  th { color: #9aa3af; font-weight: 600; }
+  .err { background: #2a1416; border: 1px solid #5b1f22; color: #ff8a8a;
+         padding: 10px 12px; border-radius: 8px; margin-bottom: 14px; display: none; }
+  .ok { color: #34d399; }
+  code { background: #0f1115; padding: 1px 6px; border-radius: 5px; }
+  .hidden { display: none; }
+  .hint { font-size: 12px; color: #6b7280; margin-top: 6px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>BenchCam</h1>
+  <div class="sub">Local bench-session dashboard &middot; start &rarr; mark &rarr; stop &rarr; review</div>
+
+  <div id="state" class="state idle"><span class="dot"></span><span id="stateText">IDLE</span></div>
+  <div id="error" class="err"></div>
+
+  <!-- START -->
+  <div id="startCard" class="card">
+    <h2>Start a session</h2>
+    <div class="row">
+      <div>
+        <label for="recorder">Recorder</label>
+        <select id="recorder">
+          <option value="obs" selected>OBS (camera preview in OBS)</option>
+          <option value="ffmpeg">ffmpeg (webcam direct)</option>
+          <option value="null">null (markers only)</option>
+        </select>
+      </div>
+      <div>
+        <label for="profile">Profile (optional)</label>
+        <input id="profile" placeholder="default" />
+      </div>
+    </div>
+    <p class="hint">OBS recorder needs OBS Studio running with its WebSocket server enabled.</p>
+    <div style="margin-top:12px"><button id="startBtn" class="big">Start session</button></div>
+  </div>
+
+  <!-- ACTIVE -->
+  <div id="activeCard" class="card hidden">
+    <h2>Recording</h2>
+    <p class="mut">Session <code id="sid"></code> &middot; recorder <code id="rec"></code><br>
+       elapsed <b id="elapsed">0.0s</b> &middot; <b id="count">0</b> marker(s)
+       &middot; <code id="folder"></code></p>
+    <div style="margin:12px 0"><button id="markBtn" class="big mark">MARK now</button></div>
+    <div class="row">
+      <div style="flex:3"><input id="label" placeholder="label (optional)" /></div>
+      <div style="flex:1"><button id="markLabelBtn">Mark + label</button></div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <div style="flex:3"><input id="note" placeholder="add a note to notes.md" /></div>
+      <div style="flex:1"><button id="noteBtn" class="ghost">Add note</button></div>
+    </div>
+    <p class="hint">Hands busy? <code>benchcam live</code> in a terminal is the fastest single-keypress marking path.</p>
+    <div style="margin-top:14px"><button id="stopBtn" class="big stop">Stop session</button></div>
+  </div>
+
+  <!-- MARKERS -->
+  <div id="markersCard" class="card hidden">
+    <h2>Markers</h2>
+    <table><thead><tr><th>#</th><th>elapsed</th><th>label</th></tr></thead>
+    <tbody id="markers"></tbody></table>
+  </div>
+
+  <!-- REVIEW -->
+  <div id="reviewCard" class="card hidden">
+    <h2>Last session &amp; review</h2>
+    <p id="summary" class="mut"></p>
+    <div class="row">
+      <div><label>pre (s)</label><input id="pre" type="number" value="3" step="0.5"></div>
+      <div><label>post (s)</label><input id="post" type="number" value="5" step="0.5"></div>
+      <div><label>speed (x)</label><input id="speed" type="number" value="8" step="1"></div>
+    </div>
+    <div style="margin-top:12px"><button id="reviewBtn" class="big">Make review.mp4</button></div>
+    <p id="reviewOut" class="ok"></p>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let busy = false;
+
+function showError(msg) {
+  const e = $("error");
+  if (msg) { e.textContent = msg; e.style.display = "block"; }
+  else { e.style.display = "none"; }
+}
+
+async function api(path, body) {
+  const res = await fetch(path, {
+    method: body === undefined ? "GET" : "POST",
+    headers: {"Content-Type": "application/json"},
+    body: body === undefined ? undefined : JSON.stringify(body || {}),
+  });
+  const data = await res.json();
+  if (!data.ok && data.error) showError(data.error); else showError(null);
+  return data;
+}
+
+function render(s) {
+  const active = s.active;
+  $("state").className = "state " + (active ? "rec" : "idle");
+  $("stateText").textContent = active ? "● RECORDING" : "○ IDLE";
+  $("startCard").classList.toggle("hidden", active);
+  $("activeCard").classList.toggle("hidden", !active);
+  $("markersCard").classList.toggle("hidden", !active || (s.markers||[]).length === 0);
+  if (active) {
+    $("sid").textContent = s.session_id;
+    $("rec").textContent = s.recorder;
+    $("folder").textContent = s.folder;
+    $("elapsed").textContent = (s.elapsed_seconds||0).toFixed(1) + "s";
+    $("count").textContent = s.marker_count||0;
+    const tb = $("markers"); tb.innerHTML = "";
+    (s.markers||[]).slice().reverse().forEach(m => {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td>${m.index}</td><td>${m.elapsed.toFixed(2)}s</td><td>${escapeHtml(m.label||"")}</td>`;
+      tb.appendChild(tr);
+    });
+  }
+  // review card: show when there is a finished session
+  const last = s.last_session;
+  $("reviewCard").classList.toggle("hidden", active || !last);
+  if (!active && last) {
+    $("summary").innerHTML = `Session <code>${last.session_id}</code> — `
+      + `${last.marker_count} marker(s), ${last.duration_seconds.toFixed(1)}s — `
+      + `<code>${last.folder}</code>`;
+  }
+  if (s.last_review) $("reviewOut").textContent = "review.mp4: " + s.last_review;
+}
+
+function escapeHtml(t){return t.replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+
+async function refresh(){ try { render(await api("/api/status")); } catch(e){} }
+
+$("startBtn").onclick = async () => {
+  $("startBtn").disabled = true;
+  const d = await api("/api/start", {recorder: $("recorder").value, profile: $("profile").value});
+  $("startBtn").disabled = false;
+  if (d.ok) render(d);
+};
+$("markBtn").onclick = async () => { const d = await api("/api/mark", {label: ""}); if (d.ok) render(d); };
+$("markLabelBtn").onclick = async () => {
+  const d = await api("/api/mark", {label: $("label").value}); if (d.ok) { $("label").value=""; render(d); }
+};
+$("noteBtn").onclick = async () => {
+  const d = await api("/api/note", {text: $("note").value}); if (d.ok) $("note").value="";
+};
+$("stopBtn").onclick = async () => {
+  if (!confirm("Stop the session?")) return;
+  $("stopBtn").disabled = true;
+  const d = await api("/api/stop");
+  $("stopBtn").disabled = false;
+  await refresh();
+};
+$("reviewBtn").onclick = async () => {
+  $("reviewBtn").disabled = true;
+  $("reviewOut").textContent = "Rendering review.mp4 (this can take a while)…";
+  const d = await api("/api/review", {pre: $("pre").value, post: $("post").value, speed: $("speed").value});
+  $("reviewBtn").disabled = false;
+  if (d.ok) $("reviewOut").textContent = "review.mp4: " + d.review_path;
+  else $("reviewOut").textContent = "";
+};
+
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
+"""

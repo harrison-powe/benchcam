@@ -186,6 +186,7 @@ A free-form Markdown file for whatever you want to jot down during the session.
 | `benchcam live` | Open an interactive shell that marks the active session on a single keypress. |
 | `benchcam end` | Stop recording and close the active session. |
 | `benchcam edit` | Render a marker-aware `review.mp4` (timelapse + normal-speed marker windows + captions). |
+| `benchcam dashboard` | Start a local web UI to run a whole session (start/mark/stop/review) from a browser. |
 
 Useful options:
 
@@ -376,6 +377,72 @@ Notes:
   `obs_recording.txt` remains), `edit` follows that pointer to the original file;
   if it still can't be found, it fails with a clear message.
 
+## Web dashboard (run a session without a terminal)
+
+`benchcam dashboard` starts a small **local** web server (stdlib `http.server`,
+bound to `127.0.0.1:8765`, no accounts, no external exposure) and opens your
+browser to a one-page UI. From there you can start a session, mark events (click
+or labeled), add notes, stop, and render the review clip — without typing any
+terminal commands.
+
+```powershell
+benchcam dashboard
+```
+
+The page has a clear **● RECORDING / ○ IDLE** indicator so you always know the
+state, a big **MARK** button (plus a label field), a notes field, **Stop**, and a
+**Make review.mp4** button (with `pre`/`post`/`speed` fields). It calls the same
+BenchCam logic as the CLI — start = `new` + `run`, mark = `mark`, stop = recorder
+stop + collect + `end`, review = `edit`. If OBS isn't running, starting an OBS
+session shows a clear error rather than silently failing; a second start is
+refused; stopping when nothing is active is a no-op with a message.
+
+> The dashboard's MARK button is a click convenience. For hands-busy marking,
+> `benchcam live` in a terminal (single keypress per marker) is still the fastest
+> path — the dashboard does not replace it.
+
+With the OBS recorder, **OBS itself is your live camera preview** next to the
+dashboard; BenchCam just drives OBS's record start/stop so markers stay aligned.
+
+### Desktop shortcut (double-click to launch, no typing)
+
+A launcher is provided at `scripts\benchcam-dashboard.bat` (and a PowerShell
+version, `scripts\benchcam-dashboard.ps1`). It activates the project's `.venv`
+and runs `benchcam dashboard`. To make a desktop shortcut:
+
+1. In File Explorer, open the project's `scripts\` folder.
+2. Right-click **`benchcam-dashboard.bat`** → **Show more options** →
+   **Send to** → **Desktop (create shortcut)**.
+3. (Optional, to hide the console) Right-click the new desktop shortcut →
+   **Properties** → set **Run:** to **Minimized** → **OK**. You can also click
+   **Change Icon…** to pick an icon, and drag the shortcut onto the taskbar/Start
+   to **pin** it.
+
+Now double-click the shortcut: a minimized window starts the server and your
+browser opens to the dashboard. Closing that window (or pressing `Ctrl+C`) stops
+the dashboard.
+
+> The launcher assumes a `.venv` in the project root with BenchCam installed
+> (`py -3 -m venv .venv` → activate → `pip install -e .`, plus
+> `pip install -e ".[obs]"` if you use the OBS recorder).
+
+### Run a full session from the dashboard
+
+1. (OBS recorder) Open OBS with your C920S as a source so you have a live
+   preview, and make sure its WebSocket server is enabled and
+   `BENCHCAM_OBS_PASSWORD` is set (see
+   [Recording video with OBS](#recording-video-with-obs)).
+2. Double-click the desktop shortcut → the dashboard opens in your browser.
+3. Pick the recorder (OBS by default), optionally type a profile, click
+   **Start session**. The indicator turns red **● RECORDING**.
+4. Work at the bench: click **MARK now** for quick markers, or type a label and
+   click **Mark + label**; add free-form notes with the note field. Markers
+   appear in the live list with their elapsed time.
+5. Click **Stop session** → the indicator returns to **○ IDLE** and a summary
+   (marker count, duration, folder) appears.
+6. Click **Make review.mp4** → BenchCam renders the marker-aware review clip into
+   the session folder and shows its path.
+
 ### 30-second manual test (Windows 11)
 
 From the project folder, in PowerShell, with BenchCam installed:
@@ -417,12 +484,13 @@ pytest
 
 ```
 src/benchcam/
-    cli.py            argparse CLI (new/run/mark/live/end/edit)
+    cli.py            argparse CLI (new/run/mark/live/end/edit/dashboard)
     session.py        session model + on-disk layout
     markers.py        markers.csv reading/writing
     live.py           interactive single-keypress marking shell
     keypress.py       cross-platform single-key reader (msvcrt / termios)
     editor.py         marker-aware auto-edit -> review.mp4 (ffmpeg)
+    dashboard.py      local web UI (stdlib http.server) over the existing logic
     clock.py          time helpers
     recorders/
         base.py       Recorder interface
@@ -430,6 +498,9 @@ src/benchcam/
         obs.py        ObsRecorder (OBS Studio via OBS WebSocket v5)
         ffmpeg.py     FfmpegRecorder (ffmpeg subprocess; Windows/dshow)
         collect.py    move an external recording into the session folder
+scripts/
+    benchcam-dashboard.bat   Windows launcher (double-click / desktop shortcut)
+    benchcam-dashboard.ps1   PowerShell launcher
 tests/                unit tests
 ```
 
