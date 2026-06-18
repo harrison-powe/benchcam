@@ -230,6 +230,68 @@ def test_review_without_finished_session_raises(root):
         ctrl.review()
 
 
+def test_review_auto_opens_the_clip(monkeypatch, root):
+    # Fix 4: review() opens the rendered file in the default player.
+    _use_recorder(monkeypatch, FakeRecorder())
+    ctrl = DashboardController(root)
+    started = ctrl.start("obs", "p")
+    ctrl.stop()
+
+    monkeypatch.setattr(editor_mod, "run_edit", lambda d, **k: f"{d}/review.mp4")
+    opened = {}
+    monkeypatch.setattr(dash, "open_file", lambda p: opened.setdefault("path", str(p)))
+
+    res = ctrl.review()
+
+    assert res["opened"] is True
+    assert opened["path"].endswith("review.mp4")
+    assert res["review_path"].endswith("review.mp4")  # green link still returned
+
+
+def test_review_open_failure_is_nonfatal_and_keeps_link(monkeypatch, root):
+    _use_recorder(monkeypatch, FakeRecorder())
+    ctrl = DashboardController(root)
+    ctrl.start("obs", "p")
+    ctrl.stop()
+
+    monkeypatch.setattr(editor_mod, "run_edit", lambda d, **k: f"{d}/review.mp4")
+
+    def boom(_p):
+        raise OSError("no media player")
+
+    monkeypatch.setattr(dash, "open_file", boom)
+
+    res = ctrl.review()  # must not raise
+    assert res["opened"] is False
+    assert res["review_path"].endswith("review.mp4")
+
+
+# --------------------------------------------------------------------------- #
+# Page markup (Fixes 2 & 3 are client-side; assert the served HTML/JS)
+# --------------------------------------------------------------------------- #
+
+def test_page_uses_inpage_confirm_not_native_dialogs():
+    html = dash.PAGE_HTML
+    assert "stopConfirm" in html and "Confirm stop" in html
+    assert "to confirm" in html and "to cancel" in html
+    # No native browser dialogs anywhere in the flow.
+    assert "window.confirm" not in html
+    assert "confirm(" not in html
+    assert "alert(" not in html
+
+
+def test_page_note_and_label_blur_on_enter():
+    html = dash.PAGE_HTML
+    # Both the label and note fields submit-and-exit (blur) on Enter (Fix 2).
+    assert html.count("e.target.blur()") >= 2
+
+
+def test_page_keeps_keyboard_legend_and_shortcuts():
+    html = dash.PAGE_HTML
+    assert "mark now" in html  # legend present
+    assert "doMark" in html and "focusLastLabel" in html and "requestStop" in html
+
+
 # --------------------------------------------------------------------------- #
 # OBS connection settings (config file)
 # --------------------------------------------------------------------------- #
@@ -263,6 +325,32 @@ def test_explicit_password_is_persisted_and_overrides_config(monkeypatch, tmp_pa
     assert saved["host"] == "10.0.0.5"
     assert saved["port"] == 4500
     assert os.environ["BENCHCAM_OBS_PASSWORD"] == "fresh"
+
+
+def test_saved_password_is_reused_without_entry(monkeypatch, tmp_path):
+    # Fix 1: with a password saved in config, Start connects without me typing it.
+    monkeypatch.delenv("BENCHCAM_OBS_PASSWORD", raising=False)
+    config_mod.save_config({"obs": {"password": "sekret"}}, tmp_path)
+
+    seen = {}
+
+    class CapturingRecorder(FakeRecorder):
+        def start(self, storage_path):
+            super().start(storage_path)
+            seen["pw"] = os.environ.get("BENCHCAM_OBS_PASSWORD")
+
+    _use_recorder(monkeypatch, CapturingRecorder())
+    ctrl = DashboardController(tmp_path / "sessions", config_root=tmp_path)
+    ctrl.start("obs", "p")  # no obs_password provided
+
+    assert seen["pw"] == "sekret"
+
+
+def test_default_config_root_is_stable_and_in_repo():
+    # Fix 1: config path doesn't depend on the cwd, so it's the same every launch.
+    root = config_mod.default_config_root()
+    assert (root / "pyproject.toml").exists()
+    assert config_mod.config_path() == root / ".benchcam" / "config.json"
 
 
 def test_get_config_never_returns_password(tmp_path):

@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -64,8 +66,13 @@ class DashboardController:
         config_root: Path | str | None = None,
     ) -> None:
         self.sessions_root = Path(sessions_root)
-        # Where .benchcam/config.json lives (defaults to the launch directory).
-        self._config_root = Path(config_root) if config_root is not None else Path.cwd()
+        # Where .benchcam/config.json lives. Defaults to a STABLE, cwd-independent
+        # location so a saved OBS password is reused on every launch (Fix 1).
+        self._config_root = (
+            Path(config_root)
+            if config_root is not None
+            else config_mod.default_config_root()
+        )
         self._session: session_mod.Session | None = None
         self._recorder = None
         self._last_session: session_mod.Session | None = None
@@ -236,7 +243,15 @@ class DashboardController:
             target.folder, pre=pre, post=post, speed=speed, out=lambda _m: None
         )
         self._last_review = str(output)
-        return {"review_path": str(output)}
+        # Auto-open the clip in the system default player (best-effort). The
+        # server runs on the user's machine, so this pops the video open for
+        # them; failure is non-fatal and we still return the link.
+        opened = True
+        try:
+            open_file(output)
+        except Exception:  # noqa: BLE001 - never fail review on an open() problem
+            opened = False
+        return {"review_path": str(output), "opened": opened}
 
     # -- helpers -------------------------------------------------------------
     def _prepare_obs_connection(self, password, host, port) -> None:
@@ -434,6 +449,21 @@ def _as_float(value, default: float) -> float:
         return default
 
 
+def open_file(path) -> None:
+    """Open a file in the OS default application (Windows/macOS/Linux).
+
+    Used to pop ``review.mp4`` open in the default media player when an edit
+    finishes. Best-effort; callers treat any failure as non-fatal.
+    """
+    target = str(path)
+    if sys.platform.startswith("win"):
+        os.startfile(target)  # type: ignore[attr-defined]  # noqa: PLW1514 - Windows only
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", target])
+    else:
+        subprocess.Popen(["xdg-open", target])
+
+
 def make_server(host: str, port: int, sessions_root: Path | str) -> tuple[HTTPServer, DashboardController]:
     """Create the HTTP server + controller (used by serve() and by tests)."""
     controller = DashboardController(sessions_root)
@@ -530,6 +560,11 @@ PAGE_HTML = """<!doctype html>
   code { background: #0f1115; padding: 1px 6px; border-radius: 5px; }
   .hidden { display: none; }
   .hint { font-size: 12px; color: #6b7280; margin-top: 6px; }
+  .confirm { margin-top: 12px; padding: 12px 14px; border-radius: 10px;
+             background: #2a1416; border: 1px solid #5b1f22; color: #ffb4b4; }
+  .confirm b { color: #fff; }
+  .confirm .actions { margin-top: 10px; display: flex; gap: 10px; }
+  .confirm .actions button { flex: 0 0 auto; }
 </style>
 </head>
 <body>
@@ -563,7 +598,7 @@ PAGE_HTML = """<!doctype html>
       <div class="row">
         <div style="flex:2">
           <label for="obsPassword">OBS WebSocket password</label>
-          <input id="obsPassword" type="password" placeholder="enter password" autocomplete="off" />
+          <input id="obsPassword" type="password" placeholder="enter password (saved after first use)" autocomplete="off" />
         </div>
         <div><label for="obsHost">Host</label><input id="obsHost" placeholder="localhost" /></div>
         <div><label for="obsPort">Port</label><input id="obsPort" placeholder="4455" /></div>
@@ -597,6 +632,13 @@ PAGE_HTML = """<!doctype html>
        <b>Q</b> = stop session.
        For hands-busy marking, <code>benchcam live</code> in a terminal is still fastest.</p>
     <div style="margin-top:14px"><button id="stopBtn" class="big stop">Stop session</button></div>
+    <div id="stopConfirm" class="confirm hidden">
+      Stop session? Press <b>Q</b> again to confirm, <b>Esc</b> to cancel.
+      <div class="actions">
+        <button id="stopConfirmYes" class="stop">Confirm stop</button>
+        <button id="stopConfirmNo" class="ghost">Cancel</button>
+      </div>
+    </div>
   </div>
 
   <!-- MARKERS -->
@@ -661,6 +703,7 @@ function render(s) {
     renderMarkers(s.markers||[]);
   } else {
     renderedCount = -1;  // start the next session's table fresh
+    if (typeof hideStopConfirm === "function") hideStopConfirm();
   }
   // review card: show when there is a finished session
   const last = s.last_session;
@@ -732,9 +775,13 @@ async function loadConfig(){
       const o = d.config.obs;
       if (o.host) $("obsHost").value = o.host;
       if (o.port) $("obsPort").value = o.port;
-      $("obsSaved").textContent = o.has_password
-        ? "A password is saved locally — leave the field blank to reuse it."
-        : "No password saved yet — enter it once and it will be remembered.";
+      if (o.has_password) {
+        $("obsPassword").placeholder = "saved — leave blank to reuse";
+        $("obsSaved").textContent = "A password is saved locally — leave the field blank to reuse it.";
+      } else {
+        $("obsPassword").placeholder = "enter password (saved after first use)";
+        $("obsSaved").textContent = "No password saved yet — enter it once and it will be remembered.";
+      }
     }
   } catch(e){}
   toggleObsPanel();
@@ -756,11 +803,17 @@ $("markBtn").onclick = doMark;
 $("markLabelBtn").onclick = async () => {
   const d = await api("/api/mark", {label: $("label").value}); if (d.ok) { $("label").value=""; render(d); }
 };
-$("label").addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); $("markLabelBtn").click(); }});
+// Enter submits AND exits the field (blurs) so Space/L/N/Q shortcuts work again
+// immediately — same behavior for the label field and the note field (Fix 2).
+$("label").addEventListener("keydown", e => {
+  if (e.key === "Enter") { e.preventDefault(); $("markLabelBtn").click(); e.target.blur(); }
+});
 $("noteBtn").onclick = async () => {
   const d = await api("/api/note", {text: $("note").value}); if (d.ok) $("note").value="";
 };
-$("note").addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); $("noteBtn").click(); }});
+$("note").addEventListener("keydown", e => {
+  if (e.key === "Enter") { e.preventDefault(); $("noteBtn").click(); e.target.blur(); }
+});
 
 // Keyboard shortcuts — only when a session is active and you're NOT typing in a
 // field, so spacebar-mark never fires while you're entering a label or note.
@@ -771,19 +824,29 @@ document.addEventListener("keydown", (e) => {
   if (typing) return;
   if (!current.active) return;
   const k = e.key;
+  if (k === "Escape") { if (confirmingStop) { e.preventDefault(); hideStopConfirm(); } return; }
   if (k === " " || k === "Spacebar" || k === "Enter") { e.preventDefault(); doMark(); }
   else if (k === "l" || k === "L") { e.preventDefault(); focusLastLabel(); }
   else if (k === "n" || k === "N") { e.preventDefault(); $("note").focus(); }
-  else if (k === "q" || k === "Q") { e.preventDefault(); $("stopBtn").click(); }
+  else if (k === "q" || k === "Q") { e.preventDefault(); requestStop(); }
 });
-$("stopBtn").onclick = async () => {
-  if (!confirm("Stop the session?")) return;
+
+// In-page stop confirmation — fully keyboard-driven, no native browser dialog.
+let confirmingStop = false;
+function showStopConfirm() { confirmingStop = true; $("stopConfirm").classList.remove("hidden"); }
+function hideStopConfirm() { confirmingStop = false; $("stopConfirm").classList.add("hidden"); }
+function requestStop() { if (confirmingStop) doStop(); else showStopConfirm(); }
+async function doStop() {
+  hideStopConfirm();
   $("stopBtn").disabled = true;
   const d = await api("/api/stop", {});   // POST (a GET would 404 and never stop)
   $("stopBtn").disabled = false;
   if (d.ok && d.warning) showError(d.warning);  // ended cleanly, but note the issue
   await refresh();
-};
+}
+$("stopBtn").onclick = requestStop;       // mouse click shows the same in-page confirm
+$("stopConfirmYes").onclick = doStop;
+$("stopConfirmNo").onclick = hideStopConfirm;
 $("reviewBtn").onclick = async () => {
   $("reviewBtn").disabled = true;
   $("reviewOut").textContent = "Rendering review.mp4 (this can take a while)…";
