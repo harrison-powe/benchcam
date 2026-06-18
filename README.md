@@ -68,6 +68,41 @@ benchcam mark "fault observed"
 benchcam end
 ```
 
+### Fast marking with `benchcam live`
+
+`new`/`run`/`mark`/`end` each run as a separate process, which is fine for
+occasional marks but slow when your hands are busy at the bench. `benchcam live`
+opens a single long-running shell that holds the active session in memory and
+marks on **one keypress** — no per-mark process startup, no re-reading
+`markers.csv`.
+
+```powershell
+# Create a session first (if you don't already have an active one)
+benchcam new --profile bench-a
+
+# Enter the live shell (starts the session if it hasn't started yet)
+benchcam live
+```
+
+Inside the shell:
+
+| Key | Action |
+| --- | --- |
+| `Space` / `Enter` | Mark **now**, no label. Fast path — prints index + elapsed seconds instantly. |
+| `l` | Mark now, then type a one-line label (empty label is allowed). |
+| `n` | Append a line to `notes.md` (fills the gap where notes were write-once). |
+| `s` | Show status: session id, elapsed time, marker count so far. |
+| `q` | Quit cleanly: stop the recorder, end the session, print a summary. |
+
+Notes:
+
+- `live` attaches to the same active session as the other commands. If the
+  session is still `created`, it starts it (same effect as `run`, including
+  `recorder.start`). If it has already `ended`, it refuses with a clear message.
+- Every mark is still **appended to `markers.csv` immediately** for crash
+  safety; only the next marker index is tracked in memory.
+- Markers made here use `source = manual`, exactly like `benchcam mark`.
+
 This produces a folder like:
 
 ```
@@ -118,6 +153,7 @@ A free-form Markdown file for whatever you want to jot down during the session.
 | `benchcam new` | Create a new session folder and make it the active session. |
 | `benchcam run` | Start recording / start the session clock. |
 | `benchcam mark "label"` | Append a time-stamped marker to the active session. |
+| `benchcam live` | Open an interactive shell that marks the active session on a single keypress. |
 | `benchcam end` | Stop recording and close the active session. |
 
 Useful options:
@@ -140,6 +176,28 @@ The "active" session is tracked by a small pointer file at
 
 See `src/benchcam/recorders/` for the stub TODOs.
 
+### 30-second manual test (Windows 11)
+
+From the project folder, in PowerShell, with BenchCam installed:
+
+```powershell
+benchcam new --profile quicktest
+benchcam live
+```
+
+Then, inside the live shell:
+
+1. Press `Space` twice — you should see `marker #1` and `marker #2` with elapsed
+   seconds.
+2. Press `l`, type `chip lifted`, press `Enter` — you should see `marker #3 ... chip lifted`.
+3. Press `n`, type `looks good`, press `Enter` — confirms a note was appended.
+4. Press `s` — prints the session id, elapsed time, and `markers 3`.
+5. Press `q` — prints a summary and exits.
+
+Finally, open the newest folder under `sessions\` and confirm `markers.csv` has
+three rows (two blank labels, one `chip lifted`) and `notes.md` ends with
+`looks good`.
+
 ## Development
 
 ```powershell
@@ -157,9 +215,11 @@ pytest
 
 ```
 src/benchcam/
-    cli.py            argparse CLI (new/run/mark/end)
+    cli.py            argparse CLI (new/run/mark/live/end)
     session.py        session model + on-disk layout
     markers.py        markers.csv reading/writing
+    live.py           interactive single-keypress marking shell
+    keypress.py       cross-platform single-key reader (msvcrt / termios)
     clock.py          time helpers
     recorders/
         base.py       Recorder interface

@@ -17,6 +17,8 @@ import sys
 from pathlib import Path
 
 from . import __version__
+from . import keypress
+from . import live as live_mod
 from . import session as session_mod
 from .recorders import get_recorder
 from .recorders.base import RecorderError
@@ -79,6 +81,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_root_arg(p_end)
     p_end.set_defaults(func=cmd_end)
 
+    # live
+    p_live = sub.add_parser(
+        "live",
+        help="Interactive shell: mark the active session on a single keypress.",
+    )
+    _add_root_arg(p_live)
+    p_live.set_defaults(func=cmd_live)
+
     return parser
 
 
@@ -130,6 +140,16 @@ def cmd_end(args: argparse.Namespace) -> int:
     print(f"Ended session {session.session_id}.")
     print(f"  markers: {session.markers_file}")
     return 0
+
+
+def cmd_live(args: argparse.Namespace) -> int:
+    session = session_mod.get_active_session(Path(args.sessions_root))
+    recorder = get_recorder(session.recorder)
+    return live_mod.live_session(
+        session,
+        recorder=recorder,
+        read_key=keypress.read_key,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
