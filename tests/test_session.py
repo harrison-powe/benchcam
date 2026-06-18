@@ -7,7 +7,7 @@ import json
 import pytest
 
 from benchcam import session as session_mod
-from benchcam.session import SessionError
+from benchcam.session import SessionError, slugify
 
 
 def test_create_session_creates_folder_and_files(tmp_path):
@@ -96,6 +96,52 @@ def test_start_and_end_session_updates_status(tmp_path):
     session_mod.end_session(session)
     assert session.status == session_mod.STATUS_ENDED
     assert session.ended_wall_time is not None
+
+
+def test_slugify_handles_spaces_unsafe_chars_and_empty():
+    assert slugify("Moteus First Spin") == "moteus-first-spin"
+    assert slugify("  Bad/Chars: #1!! ") == "badchars-1"
+    assert slugify("a   b") == "a-b"
+    assert slugify("---") == ""
+    assert slugify("") == ""
+    assert slugify(None) == ""
+
+
+def test_create_session_named_folder_and_name_field(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        session_mod.clock, "folder_timestamp", lambda dt: "2026-06-18_14-41-31"
+    )
+    s = session_mod.create_session(root=tmp_path / "sessions", name="Moteus First Spin!")
+    assert s.session_id == "2026-06-18_14-41-31_moteus-first-spin"
+    assert s.folder.name == s.session_id
+    assert s.name == "Moteus First Spin!"        # human-readable stored
+    assert s.display_name == "Moteus First Spin!"
+    # name persisted to session.json
+    data = json.loads(s.session_file.read_text(encoding="utf-8"))
+    assert data["name"] == "Moteus First Spin!"
+
+
+def test_create_session_unnamed_is_timestamp_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        session_mod.clock, "folder_timestamp", lambda dt: "2026-06-18_14-41-31"
+    )
+    s = session_mod.create_session(root=tmp_path / "sessions")
+    assert s.session_id == "2026-06-18_14-41-31"  # no slug appended
+    assert s.name == ""
+    assert s.display_name == "2026-06-18_14-41-31"
+
+
+def test_load_old_session_without_name_falls_back_to_folder(tmp_path):
+    root = tmp_path / "sessions"
+    s = session_mod.create_session(root=root)
+    # Simulate an older session.json that predates the name field.
+    data = json.loads(s.session_file.read_text(encoding="utf-8"))
+    data.pop("name", None)
+    s.session_file.write_text(json.dumps(data), encoding="utf-8")
+
+    loaded = session_mod.load_session(s.folder)
+    assert loaded.name == ""
+    assert loaded.display_name == loaded.session_id
 
 
 def test_cannot_start_ended_session(tmp_path):

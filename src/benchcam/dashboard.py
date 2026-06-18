@@ -130,6 +130,7 @@ class DashboardController:
         recorder_name: str = "obs",
         profile: str = "default",
         *,
+        name: str = "",
         obs_password: str | None = None,
         obs_host: str | None = None,
         obs_port=None,
@@ -149,7 +150,10 @@ class DashboardController:
 
         recorder = get_recorder(recorder_name)
         session = session_mod.create_session(
-            root=self.sessions_root, profile=profile, recorder=recorder_name
+            root=self.sessions_root,
+            profile=profile,
+            recorder=recorder_name,
+            name=name or "",
         )
         # recorder.start may raise (e.g. OBS not running) — surface it loudly and
         # do not leave a half-started session marked active.
@@ -245,8 +249,72 @@ class DashboardController:
             raise DashboardError(
                 "No finished session to review yet. Stop a session first."
             )
+        return self._render_review(target.folder, pre, post, speed)
+
+    # -- session library (browse past sessions) ------------------------------
+    def library(self) -> dict:
+        """Scan the sessions root and return a card per session, newest first."""
+        cards = []
+        root = self.sessions_root
+        if root.exists():
+            for folder in root.iterdir():
+                if not folder.is_dir():
+                    continue
+                if not (folder / session_mod.SESSION_FILENAME).exists():
+                    continue
+                try:
+                    session = session_mod.load_session(folder)
+                except Exception:  # noqa: BLE001 - skip unreadable session folders
+                    continue
+                cards.append(self._session_card(session))
+        cards.sort(key=lambda c: c.pop("_sort"), reverse=True)
+        return {"sessions": cards}
+
+    def open_video(self, session: str) -> dict:
+        folder = self._resolve_session_dir(session)
+        capture = editor_mod.find_capture(folder)  # raises EditError if none
+        open_file(capture)
+        return {"opened": str(capture)}
+
+    def open_review(self, session: str) -> dict:
+        folder = self._resolve_session_dir(session)
+        review = folder / editor_mod.OUTPUT_FILENAME
+        if not review.exists():
+            raise DashboardError("No review.mp4 yet for this session — make one first.")
+        open_file(review)
+        return {"opened": str(review)}
+
+    def make_review(
+        self,
+        session: str,
+        pre: float = editor_mod.DEFAULT_PRE,
+        post: float = editor_mod.DEFAULT_POST,
+        speed: float = editor_mod.DEFAULT_SPEED,
+    ) -> dict:
+        folder = self._resolve_session_dir(session)
+        return self._render_review(folder, pre, post, speed)
+
+    def open_folder(self, session: str) -> dict:
+        folder = self._resolve_session_dir(session)
+        open_file(folder)  # the OS opener opens the folder in the file explorer
+        return {"opened": str(folder)}
+
+    def rename(self, session: str, name: str) -> dict:
+        """Set the friendly name in session.json (folder stays stable)."""
+        folder = self._resolve_session_dir(session)
+        loaded = session_mod.load_session(folder)
+        loaded.name = (name or "").strip()
+        loaded.save()
+        # Keep an in-memory copy in sync if it's the active/last session.
+        for ref in (self._session, self._last_session):
+            if ref is not None and ref.session_id == loaded.session_id:
+                ref.name = loaded.name
+        return {"session_id": loaded.session_id, "name": loaded.display_name}
+
+    # -- helpers -------------------------------------------------------------
+    def _render_review(self, folder, pre, post, speed) -> dict:
         output = editor_mod.run_edit(
-            target.folder, pre=pre, post=post, speed=speed, out=lambda _m: None
+            folder, pre=pre, post=post, speed=speed, out=lambda _m: None
         )
         self._last_review = str(output)
         # Auto-open the clip in the system default player (best-effort). The
@@ -259,7 +327,37 @@ class DashboardController:
             opened = False
         return {"review_path": str(output), "opened": opened}
 
-    # -- helpers -------------------------------------------------------------
+    def _resolve_session_dir(self, session: str) -> Path:
+        if not session:
+            raise DashboardError("No session specified.")
+        return editor_mod.resolve_session_dir(self.sessions_root, str(session))
+
+    def _session_card(self, session: session_mod.Session) -> dict:
+        folder = session.folder
+        has_review = (folder / editor_mod.OUTPUT_FILENAME).exists()
+        return {
+            "session_id": session.session_id,
+            "name": session.display_name,
+            "created": session.created_wall_time,
+            "marker_count": len(self._markers(session)),
+            "duration_seconds": self._duration(session),
+            "has_review": has_review,
+            "has_video": self._has_capture(folder),
+            "active": (
+                self._session is not None
+                and self._session.session_id == session.session_id
+            ),
+            "_sort": session.created_wall_time or session.session_id,
+        }
+
+    @staticmethod
+    def _has_capture(folder: Path) -> bool:
+        try:
+            editor_mod.find_capture(folder)
+            return True
+        except EditError:
+            return False
+
     def _prepare_obs_connection(self, password, host, port) -> None:
         """Persist any explicitly-provided OBS settings, then resolve them.
 
@@ -333,6 +431,22 @@ class DashboardController:
         except (TypeError, ValueError):
             return 0.0
 
+    @staticmethod
+    def _duration(session: session_mod.Session) -> float:
+        """Recorded length (started -> ended) in seconds, 0 if not finished."""
+        if session.started_wall_time and session.ended_wall_time:
+            try:
+                return max(
+                    (
+                        clock.from_iso(session.ended_wall_time)
+                        - clock.from_iso(session.started_wall_time)
+                    ).total_seconds(),
+                    0.0,
+                )
+            except (TypeError, ValueError):
+                return 0.0
+        return 0.0
+
     def _summary(self, session: session_mod.Session | None) -> dict | None:
         if session is None:
             return None
@@ -405,6 +519,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._guard(lambda _: self.controller.status(), {})
         elif path == "/api/config":
             self._guard(lambda _: self.controller.get_config(), {})
+        elif path == "/api/library":
+            self._guard(lambda _: self.controller.library(), {})
         else:
             self._send_json({"ok": False, "error": "not found"}, 404)
 
@@ -415,6 +531,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "/api/start": lambda p: self.controller.start(
                 p.get("recorder", "obs"),
                 p.get("profile", "default"),
+                name=p.get("name", ""),
                 obs_password=p.get("obs_password") or None,
                 obs_host=p.get("obs_host") or None,
                 obs_port=p.get("obs_port") or None,
@@ -429,6 +546,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 pre=_as_float(p.get("pre"), editor_mod.DEFAULT_PRE),
                 post=_as_float(p.get("post"), editor_mod.DEFAULT_POST),
                 speed=_as_float(p.get("speed"), editor_mod.DEFAULT_SPEED),
+            ),
+            "/api/open_video": lambda p: self.controller.open_video(p.get("session")),
+            "/api/open_review": lambda p: self.controller.open_review(p.get("session")),
+            "/api/make_review": lambda p: self.controller.make_review(
+                p.get("session"),
+                pre=_as_float(p.get("pre"), editor_mod.DEFAULT_PRE),
+                post=_as_float(p.get("post"), editor_mod.DEFAULT_POST),
+                speed=_as_float(p.get("speed"), editor_mod.DEFAULT_SPEED),
+            ),
+            "/api/open_folder": lambda p: self.controller.open_folder(p.get("session")),
+            "/api/rename": lambda p: self.controller.rename(
+                p.get("session"), p.get("name", "")
             ),
         }
         handler = routes.get(path)
@@ -629,6 +758,12 @@ PAGE_HTML = """<!doctype html>
         <input id="profile" placeholder="default" />
       </div>
     </div>
+    <div class="row" style="margin-top:8px">
+      <div>
+        <label for="sessionName">Session name (optional)</label>
+        <input id="sessionName" placeholder="e.g. moteus first spin" />
+      </div>
+    </div>
     <div id="obsPanel">
       <p class="hint">OBS recorder needs OBS Studio running with its WebSocket server enabled
          (Tools &rarr; WebSocket Server Settings).</p>
@@ -681,17 +816,24 @@ PAGE_HTML = """<!doctype html>
     <tbody id="markers"></tbody></table>
   </div>
 
-  <!-- REVIEW -->
-  <div id="reviewCard" class="card hidden">
-    <h2>Last session &amp; review</h2>
-    <p id="summary" class="mut"></p>
+  <!-- LIBRARY -->
+  <div id="libraryCard" class="card">
+    <div style="display:flex;align-items:center;justify-content:space-between">
+      <h2 style="margin:0">Session library</h2>
+      <button id="refreshBtn" class="ghost" style="padding:6px 12px">Refresh</button>
+    </div>
+    <p class="hint">Review settings used by "Make review" below.</p>
     <div class="row">
       <div><label>pre (s)</label><input id="pre" type="number" value="3" step="0.5"></div>
       <div><label>post (s)</label><input id="post" type="number" value="5" step="0.5"></div>
       <div><label>speed (x)</label><input id="speed" type="number" value="8" step="1"></div>
     </div>
-    <div style="margin-top:12px"><button id="reviewBtn" class="big">Make review.mp4</button></div>
     <p id="reviewOut" class="ok"></p>
+    <table>
+      <thead><tr><th>name</th><th>when</th><th>markers</th><th>length</th><th>review</th><th>actions</th></tr></thead>
+      <tbody id="library"></tbody>
+    </table>
+    <p id="libraryEmpty" class="mut hidden">No sessions yet — start one above.</p>
   </div>
 </div>
 
@@ -737,14 +879,6 @@ function render(s) {
   } else {
     renderedCount = -1;  // start the next session's table fresh
     if (typeof hideStopConfirm === "function") hideStopConfirm();
-  }
-  // review card: show when there is a finished session
-  const last = s.last_session;
-  $("reviewCard").classList.toggle("hidden", active || !last);
-  if (!active && last) {
-    $("summary").innerHTML = `Session <code>${last.session_id}</code> — `
-      + `${last.marker_count} marker(s), ${last.duration_seconds.toFixed(1)}s — `
-      + `<code>${last.folder}</code>`;
   }
   if (s.last_review) $("reviewOut").textContent = "review.mp4: " + s.last_review;
 }
@@ -834,7 +968,7 @@ function wireChangePw(){
 
 $("startBtn").onclick = async () => {
   $("startBtn").disabled = true;
-  const body = {recorder: $("recorder").value, profile: $("profile").value};
+  const body = {recorder: $("recorder").value, profile: $("profile").value, name: $("sessionName").value};
   if ($("recorder").value === "obs"){
     const pw = $("obsPassword");           // absent when a password is already saved
     body.obs_password = pw ? pw.value : "";
@@ -843,7 +977,7 @@ $("startBtn").onclick = async () => {
   }
   const d = await api("/api/start", body);
   $("startBtn").disabled = false;
-  if (d.ok) { const pw = $("obsPassword"); if (pw) pw.value = ""; render(d); }
+  if (d.ok) { const pw = $("obsPassword"); if (pw) pw.value = ""; $("sessionName").value = ""; render(d); loadLibrary(); }
 };
 $("markBtn").onclick = doMark;
 $("markLabelBtn").onclick = async () => {
@@ -889,21 +1023,79 @@ async function doStop() {
   $("stopBtn").disabled = false;
   if (d.ok && d.warning) showError(d.warning);  // ended cleanly, but note the issue
   await refresh();
+  loadLibrary();
 }
 $("stopBtn").onclick = requestStop;       // mouse click shows the same in-page confirm
 $("stopConfirmYes").onclick = doStop;
 $("stopConfirmNo").onclick = hideStopConfirm;
-$("reviewBtn").onclick = async () => {
-  $("reviewBtn").disabled = true;
-  $("reviewOut").textContent = "Rendering review.mp4 (this can take a while)…";
-  const d = await api("/api/review", {pre: $("pre").value, post: $("post").value, speed: $("speed").value});
-  $("reviewBtn").disabled = false;
-  if (d.ok) $("reviewOut").textContent = "review.mp4: " + d.review_path;
-  else $("reviewOut").textContent = "";
-};
+// ---- Session library -------------------------------------------------------
+function fmtWhen(iso){
+  if (!iso) return "";
+  try { const d = new Date(iso); return isNaN(d) ? iso : d.toLocaleString(); }
+  catch(e){ return iso; }
+}
+function fmtLen(sec){ sec = sec||0; const m = Math.floor(sec/60), s = Math.round(sec%60); return m + "m " + s + "s"; }
+
+function reviewParams(){ return {pre: $("pre").value, post: $("post").value, speed: $("speed").value}; }
+
+async function loadLibrary(){
+  // Don't clobber a name field being edited.
+  const act = document.activeElement;
+  if (act && act.classList && act.classList.contains("nm")) return;
+  const d = await api("/api/library");
+  if (!d.ok) return;
+  const tb = $("library"); tb.innerHTML = "";
+  $("libraryEmpty").classList.toggle("hidden", d.sessions.length > 0);
+  d.sessions.forEach(s => tb.appendChild(libraryRow(s)));
+}
+
+function libraryRow(s){
+  const tr = document.createElement("tr");
+
+  // name (editable; saves via /api/rename, folder stays put)
+  const tdName = document.createElement("td");
+  const nm = document.createElement("input");
+  nm.className = "nm"; nm.value = s.name; nm.dataset.id = s.session_id;
+  nm.title = "session id: " + s.session_id;
+  const saveName = () => api("/api/rename", {session: s.session_id, name: nm.value}).then(loadLibrary);
+  nm.addEventListener("keydown", ev => { if (ev.key === "Enter"){ ev.preventDefault(); saveName(); nm.blur(); }});
+  nm.addEventListener("change", saveName);
+  tdName.appendChild(nm);
+  if (s.active){ const b = document.createElement("div"); b.className = "hint"; b.textContent = "● recording"; tdName.appendChild(b); }
+
+  const tdWhen = document.createElement("td"); tdWhen.textContent = fmtWhen(s.created);
+  const tdMarks = document.createElement("td"); tdMarks.textContent = s.marker_count;
+  const tdLen = document.createElement("td"); tdLen.textContent = s.duration_seconds ? fmtLen(s.duration_seconds) : "—";
+  const tdRev = document.createElement("td"); tdRev.textContent = s.has_review ? "✓" : "—";
+
+  const tdAct = document.createElement("td");
+  const mkBtn = (text, cls, fn) => { const b = document.createElement("button"); b.textContent = text; b.className = cls; b.style.cssText = "padding:6px 10px;margin:2px"; b.onclick = fn; return b; };
+
+  const vid = mkBtn("Open video", "ghost", async () => { await api("/api/open_video", {session: s.session_id}); });
+  vid.disabled = !s.has_video;
+  tdAct.appendChild(vid);
+
+  if (s.has_review){
+    tdAct.appendChild(mkBtn("Open review", "", async () => { await api("/api/open_review", {session: s.session_id}); }));
+  } else {
+    tdAct.appendChild(mkBtn("Make review", "", async (e) => {
+      const b = e.target; b.disabled = true; b.textContent = "Rendering…";
+      const d = await api("/api/make_review", Object.assign({session: s.session_id}, reviewParams()));
+      if (d.ok) $("reviewOut").textContent = "review.mp4: " + d.review_path;
+      await loadLibrary();
+    }));
+  }
+  tdAct.appendChild(mkBtn("Open folder", "ghost", async () => { await api("/api/open_folder", {session: s.session_id}); }));
+
+  [tdName, tdWhen, tdMarks, tdLen, tdRev, tdAct].forEach(td => tr.appendChild(td));
+  return tr;
+}
+
+$("refreshBtn").onclick = loadLibrary;
 
 loadConfig();
 wireChangePw();
+loadLibrary();
 refresh();
 setInterval(refresh, 1000);
 </script>

@@ -391,11 +391,26 @@ benchcam dashboard
 
 The page has a clear **● RECORDING / ○ IDLE** indicator so you always know the
 state, a big **MARK** button (plus a label field), a notes field, **Stop**, and a
-**Make review.mp4** button (with `pre`/`post`/`speed` fields). It calls the same
-BenchCam logic as the CLI — start = `new` + `run`, mark = `mark`, stop = recorder
-stop + collect + `end`, review = `edit`. If OBS isn't running, starting an OBS
-session shows a clear error rather than silently failing; a second start is
-refused; stopping when nothing is active is a no-op with a message.
+**Session library** with per-session actions. It calls the same BenchCam logic as
+the CLI — start = `new` + `run`, mark = `mark`, stop = recorder stop + collect +
+`end`, review = `edit`. If OBS isn't running, starting an OBS session shows a
+clear error rather than silently failing; a second start is refused; stopping
+when nothing is active is a no-op with a message.
+
+**Naming sessions:** the Start screen has an optional **Session name** field.
+When set, the session folder becomes `<timestamp>_<slug>` (e.g.
+`2026-06-18_14-41-31_moteus-first-spin`) — the timestamp prefix is kept for
+sorting/uniqueness — and the friendly name is stored in `session.json` so the UI
+shows it nicely. With no name, the folder is timestamp-only as before; older
+sessions without a name fall back to showing their folder name.
+
+**Session library:** a list of every session under the sessions root (newest
+first) showing the name, date/time, marker count, length, and whether a
+`review.mp4` exists. Per row you can **Open video** (the capture in your default
+player), **Make review** / **Open review** (render with the `pre`/`post`/`speed`
+controls, or open the existing one), **Open folder** (in the file explorer), and
+rename the session inline (this updates `session.json`; the folder stays put).
+The library just scans the session folders — there's no separate database.
 
 > The dashboard's MARK button is a click convenience. For hands-busy marking,
 > `benchcam live` in a terminal (single keypress per marker) is still the fastest
@@ -480,17 +495,18 @@ Prefer the `.vbs` launcher above for a no-console, pinnable experience.
    preview, and make sure its WebSocket server is enabled (see
    [Recording video with OBS](#recording-video-with-obs)).
 2. Double-click the desktop shortcut → the dashboard opens in your browser.
-3. Pick the recorder (OBS by default), optionally type a profile, and — the
-   first time — paste the OBS WebSocket password into the **OBS WebSocket
-   password** field (it's saved locally afterward). Click **Start session**; the
-   indicator turns red **● RECORDING**.
+3. Pick the recorder (OBS by default), optionally type a profile and a
+   **Session name**, and — the first time — paste the OBS WebSocket password into
+   the **OBS WebSocket password** field (it's saved locally afterward). Click
+   **Start session**; the indicator turns red **● RECORDING**.
 4. Work at the bench: click **MARK now** for quick markers, or type a label and
    click **Mark + label**; add free-form notes with the note field. Markers
    appear in the live list with their elapsed time.
-5. Click **Stop session** → the indicator returns to **○ IDLE** and a summary
-   (marker count, duration, folder) appears.
-6. Click **Make review.mp4** → BenchCam renders the marker-aware review clip into
-   the session folder and shows its path.
+5. Click **Stop session** → the indicator returns to **○ IDLE** and the session
+   appears at the top of the **Session library**.
+6. In the library row, click **Make review** → BenchCam renders the marker-aware
+   review clip into the session folder, opens it, and the row flips to **Open
+   review** for next time. **Open video** plays the raw capture.
 
 ### 30-second manual test (Windows 11)
 
