@@ -293,6 +293,69 @@ def test_page_keeps_keyboard_legend_and_shortcuts():
 
 
 # --------------------------------------------------------------------------- #
+# Cleanup 1 — idempotent launch (reuse a running dashboard)
+# --------------------------------------------------------------------------- #
+
+def test_is_dashboard_running_detects_serving_and_closed(tmp_path):
+    import socket
+
+    httpd, _ = make_server("127.0.0.1", 0, tmp_path / "sessions")
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        assert dash.is_dashboard_running("127.0.0.1", port) is True
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+    # A port with nothing listening must report False.
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    free_port = s.getsockname()[1]
+    s.close()
+    assert dash.is_dashboard_running("127.0.0.1", free_port) is False
+
+
+def test_serve_reuses_running_dashboard_instead_of_starting_a_second(monkeypatch, tmp_path):
+    monkeypatch.setattr(dash, "is_dashboard_running", lambda *a, **k: True)
+    opened = {}
+    monkeypatch.setattr(dash.webbrowser, "open", lambda url: opened.setdefault("url", url))
+
+    def must_not_start(*a, **k):
+        raise AssertionError("serve() must not start a second server when one is running")
+
+    monkeypatch.setattr(dash, "make_server", must_not_start)
+
+    rc = dash.serve(host="127.0.0.1", port=8765, sessions_root=tmp_path, open_browser=True)
+
+    assert rc == 0
+    assert opened["url"] == "http://127.0.0.1:8765/"
+
+
+# --------------------------------------------------------------------------- #
+# Cleanup 2 — hide the password field when one is saved
+# --------------------------------------------------------------------------- #
+
+def test_build_page_includes_password_field_when_not_saved():
+    html = dash.build_page(has_password=False)
+    assert 'id="obsPassword"' in html
+
+
+def test_build_page_omits_password_field_when_saved():
+    html = dash.build_page(has_password=True)
+    assert 'id="obsPassword"' not in html
+    assert "OBS password saved" in html
+    assert "changePw" in html  # the (change) reveal link
+
+
+def test_render_page_reflects_saved_password(tmp_path):
+    ctrl = DashboardController(tmp_path / "sessions", config_root=tmp_path)
+    assert 'id="obsPassword"' in ctrl.render_page()  # nothing saved yet
+    config_mod.save_config({"obs": {"password": "x"}}, tmp_path)
+    assert 'id="obsPassword"' not in ctrl.render_page()  # field hidden once saved
+
+
+# --------------------------------------------------------------------------- #
 # OBS connection settings (config file)
 # --------------------------------------------------------------------------- #
 

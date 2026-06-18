@@ -28,6 +28,7 @@ import json
 import os
 import subprocess
 import sys
+import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -94,6 +95,11 @@ class DashboardController:
                 }
             }
         }
+
+    def render_page(self) -> str:
+        """Build the dashboard HTML, reflecting whether a password is saved."""
+        has_pw = bool(config_mod.load_config(self._config_root).get("obs", {}).get("password"))
+        return build_page(has_pw)
 
     def status(self) -> dict:
         if self._session is None:
@@ -394,7 +400,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = self.path.split("?", 1)[0]
         if path in ("/", "/index.html"):
-            self._send_html(PAGE_HTML)
+            self._send_html(self.controller.render_page())
         elif path == "/api/status":
             self._guard(lambda _: self.controller.status(), {})
         elif path == "/api/config":
@@ -472,6 +478,23 @@ def make_server(host: str, port: int, sessions_root: Path | str) -> tuple[HTTPSe
     return httpd, controller
 
 
+def is_dashboard_running(
+    host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, timeout: float = 0.5
+) -> bool:
+    """Return True if a BenchCam dashboard is already serving on host:port.
+
+    Probes ``/api/status`` and checks the server identifies itself as a BenchCam
+    dashboard, so we don't mistake some other local service for ours.
+    """
+    try:
+        with urllib.request.urlopen(
+            f"http://{host}:{port}/api/status", timeout=timeout
+        ) as resp:
+            return resp.headers.get("Server", "").startswith("BenchCamDashboard")
+    except Exception:
+        return False
+
+
 def serve(
     *,
     host: str = DEFAULT_HOST,
@@ -479,6 +502,19 @@ def serve(
     sessions_root: Path | str,
     open_browser: bool = True,
 ) -> int:
+    url = f"http://{host}:{port}/"
+
+    # Idempotent launch: if a dashboard is already running, just open the browser
+    # to it instead of spawning a duplicate server (avoids piles of pythonw.exe).
+    if is_dashboard_running(host, port):
+        print(f"BenchCam dashboard is already running at {url}; opening it.")
+        if open_browser:
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
+        return 0
+
     try:
         httpd, _ = make_server(host, port, sessions_root)
     except OSError as exc:
@@ -487,7 +523,6 @@ def serve(
             "Is another dashboard already running on that port?"
         ) from exc
 
-    url = f"http://{host}:{port}/"
     print(f"BenchCam dashboard running at {url}")
     print("Keep this window open. Close it (or press Ctrl+C) to stop the dashboard.")
     if open_browser:
@@ -565,6 +600,8 @@ PAGE_HTML = """<!doctype html>
   .confirm b { color: #fff; }
   .confirm .actions { margin-top: 10px; display: flex; gap: 10px; }
   .confirm .actions button { flex: 0 0 auto; }
+  .pwsaved { padding: 9px 0; font-size: 14px; color: #34d399; }
+  .pwsaved a { color: #9aa3af; cursor: pointer; }
 </style>
 </head>
 <body>
@@ -596,14 +633,10 @@ PAGE_HTML = """<!doctype html>
       <p class="hint">OBS recorder needs OBS Studio running with its WebSocket server enabled
          (Tools &rarr; WebSocket Server Settings).</p>
       <div class="row">
-        <div style="flex:2">
-          <label for="obsPassword">OBS WebSocket password</label>
-          <input id="obsPassword" type="password" placeholder="enter password (saved after first use)" autocomplete="off" />
-        </div>
+        <!--OBS_PW_BLOCK-->
         <div><label for="obsHost">Host</label><input id="obsHost" placeholder="localhost" /></div>
         <div><label for="obsPort">Port</label><input id="obsPort" placeholder="4455" /></div>
       </div>
-      <p id="obsSaved" class="hint"></p>
     </div>
     <div style="margin-top:12px"><button id="startBtn" class="big">Start session</button></div>
   </div>
@@ -769,35 +802,48 @@ function toggleObsPanel(){ $("obsPanel").style.display = ($("recorder").value ==
 $("recorder").onchange = toggleObsPanel;
 
 async function loadConfig(){
+  // The password field's presence is rendered server-side; here we just prefill
+  // host/port from the saved config.
   try {
     const d = await api("/api/config");
     if (d.ok && d.config && d.config.obs){
       const o = d.config.obs;
       if (o.host) $("obsHost").value = o.host;
       if (o.port) $("obsPort").value = o.port;
-      if (o.has_password) {
-        $("obsPassword").placeholder = "saved — leave blank to reuse";
-        $("obsSaved").textContent = "A password is saved locally — leave the field blank to reuse it.";
-      } else {
-        $("obsPassword").placeholder = "enter password (saved after first use)";
-        $("obsSaved").textContent = "No password saved yet — enter it once and it will be remembered.";
-      }
     }
   } catch(e){}
   toggleObsPanel();
+}
+
+// When a password is saved the field is hidden behind a "(change)" link; clicking
+// it reveals an input so a new password can be entered.
+function wireChangePw(){
+  const link = $("changePw");
+  if (!link) return;
+  link.onclick = (e) => {
+    e.preventDefault();
+    const inp = document.createElement("input");
+    inp.id = "obsPassword"; inp.type = "password";
+    inp.placeholder = "enter new password"; inp.autocomplete = "off";
+    const slot = $("pwSlot"); slot.innerHTML = ""; slot.appendChild(inp);
+    const note = link.closest(".pwsaved");
+    if (note) note.style.display = "none";
+    inp.focus();
+  };
 }
 
 $("startBtn").onclick = async () => {
   $("startBtn").disabled = true;
   const body = {recorder: $("recorder").value, profile: $("profile").value};
   if ($("recorder").value === "obs"){
-    body.obs_password = $("obsPassword").value;
+    const pw = $("obsPassword");           // absent when a password is already saved
+    body.obs_password = pw ? pw.value : "";
     body.obs_host = $("obsHost").value;
     body.obs_port = $("obsPort").value;
   }
   const d = await api("/api/start", body);
   $("startBtn").disabled = false;
-  if (d.ok) { $("obsPassword").value = ""; render(d); }
+  if (d.ok) { const pw = $("obsPassword"); if (pw) pw.value = ""; render(d); }
 };
 $("markBtn").onclick = doMark;
 $("markLabelBtn").onclick = async () => {
@@ -857,9 +903,35 @@ $("reviewBtn").onclick = async () => {
 };
 
 loadConfig();
+wireChangePw();
 refresh();
 setInterval(refresh, 1000);
 </script>
 </body>
 </html>
 """
+
+# The OBS password block is rendered server-side so the field can be omitted
+# entirely once a password is saved (Cleanup 2).
+_OBS_PW_INPUT = (
+    '<div style="flex:2">'
+    '<label for="obsPassword">OBS WebSocket password</label>'
+    '<input id="obsPassword" type="password" '
+    'placeholder="enter password (saved after first use)" autocomplete="off" />'
+    "</div>"
+)
+
+_OBS_PW_SAVED = (
+    '<div style="flex:2">'
+    "<label>OBS WebSocket password</label>"
+    '<div class="pwsaved">OBS password saved &#10003; '
+    '<a id="changePw">(change)</a></div>'
+    '<div id="pwSlot"></div>'
+    "</div>"
+)
+
+
+def build_page(has_password: bool) -> str:
+    """Render the dashboard HTML, omitting the password input when one is saved."""
+    block = _OBS_PW_SAVED if has_password else _OBS_PW_INPUT
+    return PAGE_HTML.replace("<!--OBS_PW_BLOCK-->", block)
