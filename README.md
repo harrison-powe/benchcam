@@ -404,27 +404,56 @@ refused; stopping when nothing is active is a no-op with a message.
 With the OBS recorder, **OBS itself is your live camera preview** next to the
 dashboard; BenchCam just drives OBS's record start/stop so markers stay aligned.
 
-### Desktop shortcut (double-click to launch, no typing)
+### Launcher with no console window (recommended)
 
-A launcher is provided at `scripts\benchcam-dashboard.bat` (and a PowerShell
-version, `scripts\benchcam-dashboard.ps1`). It activates the project's `.venv`
-and runs `benchcam dashboard`. To make a desktop shortcut:
+For a clean double-click that just opens the dashboard — **no console window,
+no flash** — use `scripts\benchcam-dashboard.vbs`. It runs `benchcam dashboard`
+with the venv's `pythonw.exe` (the windowless Python), so nothing visible appears
+while the server runs in the background for your session.
+
+**Desktop shortcut (a):**
 
 1. In File Explorer, open the project's `scripts\` folder.
-2. Right-click **`benchcam-dashboard.bat`** → **Show more options** →
-   **Send to** → **Desktop (create shortcut)**.
-3. (Optional, to hide the console) Right-click the new desktop shortcut →
-   **Properties** → set **Run:** to **Minimized** → **OK**. You can also click
-   **Change Icon…** to pick an icon, and drag the shortcut onto the taskbar/Start
-   to **pin** it.
+2. Right-click **`benchcam-dashboard.vbs`** → **Show more options** → **Send to**
+   → **Desktop (create shortcut)**. Double-clicking it now opens the dashboard
+   with no console window.
 
-Now double-click the shortcut: a minimized window starts the server and your
-browser opens to the dashboard. Closing that window (or pressing `Ctrl+C`) stops
-the dashboard.
+**Pin to the taskbar (b):** A shortcut to a `.vbs` can't be pinned directly, but
+a shortcut to **`wscript.exe`** can (it's an `.exe`). So point the shortcut at
+`wscript.exe` and pass the script as an argument:
+
+1. Right-click the desktop → **New → Shortcut**.
+2. For the location, enter (use YOUR full path to the repo):
+
+   ```text
+   wscript.exe "C:\path\to\benchcam\scripts\benchcam-dashboard.vbs"
+   ```
+
+3. Name it **BenchCam**, finish, then right-click it → **Pin to taskbar**
+   (or **Pin to Start**). Because the target is `wscript.exe`, pinning is allowed.
+
+**Custom icon (c):** Right-click the shortcut → **Properties** → **Change
+Icon…** → browse to your `.ico` → **OK**. The icon shows on the desktop shortcut
+and on the pinned taskbar button.
+
+**Stopping it:** because there's no window, stop the dashboard from **Task
+Manager** → end the background **`pythonw.exe`** process running BenchCam (or just
+leave it; it's a tiny local server). If a double-click seems to do nothing, the
+dashboard is probably already running — open <http://127.0.0.1:8765> in your
+browser, or stop the existing `pythonw.exe` first.
 
 > The launcher assumes a `.venv` in the project root with BenchCam installed
 > (`py -3 -m venv .venv` → activate → `pip install -e .`, plus
 > `pip install -e ".[obs]"` if you use the OBS recorder).
+
+### Alternative launcher: the `.bat` (shows a console)
+
+`scripts\benchcam-dashboard.bat` (and the PowerShell `scripts\benchcam-dashboard.ps1`)
+activate the venv and run `benchcam dashboard` too, but they keep a **console
+window** open (closing it stops the dashboard, which is handy). To use it: open
+`scripts\`, right-click **`benchcam-dashboard.bat`** → **Send to → Desktop
+(create shortcut)**, and optionally set the shortcut's **Run:** to **Minimized**.
+Prefer the `.vbs` launcher above for a no-console, pinnable experience.
 
 ### Run a full session from the dashboard
 
@@ -499,7 +528,8 @@ src/benchcam/
         ffmpeg.py     FfmpegRecorder (ffmpeg subprocess; Windows/dshow)
         collect.py    move an external recording into the session folder
 scripts/
-    benchcam-dashboard.bat   Windows launcher (double-click / desktop shortcut)
+    benchcam-dashboard.vbs   no-console Windows launcher (recommended; pinnable)
+    benchcam-dashboard.bat   Windows launcher (keeps a console window)
     benchcam-dashboard.ps1   PowerShell launcher
 tests/                unit tests
 ```
