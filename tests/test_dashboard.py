@@ -685,3 +685,63 @@ def test_http_endpoints_drive_a_full_session(monkeypatch, root):
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_http_rename_actually_renames_folder_on_disk(monkeypatch, tmp_path):
+    """The inline name editor POSTs /api/rename; that endpoint must move the
+    FOLDER on disk (not just rewrite session.json), the library must then report
+    the new folder, and subsequent per-session actions must hit the NEW folder.
+    """
+    root = tmp_path / "sessions"
+    s = session_mod.create_session(root=root, name="old")
+    session_mod.start_session(s)
+    session_mod.end_session(s)
+    old_id = s.session_id
+    old_folder = s.folder
+
+    # open_folder shells out to the OS opener; capture the path instead.
+    opened: dict = {}
+    monkeypatch.setattr(dash, "open_file", lambda p: opened.setdefault("p", str(p)))
+
+    httpd, _ = make_server("127.0.0.1", 0, root)
+    port = httpd.server_address[1]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        # Library first reports the original folder/name.
+        lib = json.loads(_get(port, "/api/library"))
+        assert [c["session_id"] for c in lib["sessions"]] == [old_id]
+
+        res = _post(port, "/api/rename", {"session": old_id, "name": "New Name"})
+        assert res["ok"] is True
+        assert res["name"] == "New Name"
+        assert res["session_id"].endswith("_new-name")
+        assert res["session_id"].startswith(old_id.split("_")[0])  # timestamp kept
+
+        # The FOLDER on disk actually moved.
+        new_folder = root / res["session_id"]
+        assert not old_folder.exists()
+        assert new_folder.exists()
+        assert session_mod.load_session(new_folder).name == "New Name"
+
+        # The library now reports the NEW folder/name and the stale id is gone.
+        lib2 = json.loads(_get(port, "/api/library"))
+        ids = [c["session_id"] for c in lib2["sessions"]]
+        names = {c["session_id"]: c["name"] for c in lib2["sessions"]}
+        assert ids == [res["session_id"]]
+        assert old_id not in ids
+        assert names[res["session_id"]] == "New Name"
+
+        # Subsequent actions resolve against the NEW folder, not the stale one.
+        opened.clear()
+        of_new = _post(port, "/api/open_folder", {"session": res["session_id"]})
+        assert of_new["ok"] is True
+        assert opened["p"] == str(new_folder)
+
+        opened.clear()
+        of_old = _post(port, "/api/open_folder", {"session": old_id})
+        assert of_old["ok"] is False  # stale folder no longer exists
+        assert "p" not in opened
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
