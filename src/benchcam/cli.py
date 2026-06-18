@@ -4,7 +4,9 @@ Commands:
     benchcam new            create a new session (folder + files), make it active
     benchcam run            start recording for the active session
     benchcam mark "label"   log a time-stamped marker
+    benchcam live           interactive single-keypress marking shell
     benchcam end            stop recording and close the active session
+    benchcam edit           render a marker-aware review.mp4 for a session
 
 Each command is a separate process, so the "active" session is tracked on disk
 via a small pointer file (see session.py). State lives in plain local files.
@@ -18,9 +20,11 @@ import sys
 from pathlib import Path
 
 from . import __version__
+from . import editor as editor_mod
 from . import keypress
 from . import live as live_mod
 from . import session as session_mod
+from .editor import EditError
 from .recorders import get_recorder
 from .recorders.base import RecorderError
 from .session import SessionError
@@ -106,6 +110,43 @@ def build_parser() -> argparse.ArgumentParser:
     _add_root_arg(p_live)
     p_live.set_defaults(func=cmd_live)
 
+    # edit
+    p_edit = sub.add_parser(
+        "edit",
+        help="Render a marker-aware review.mp4 (timelapse + normal-speed marker "
+        "windows + captions) from a session.",
+    )
+    _add_root_arg(p_edit)
+    p_edit.add_argument(
+        "--session",
+        default=None,
+        help="Session id or folder path to edit (default: newest session).",
+    )
+    p_edit.add_argument(
+        "--pre",
+        type=float,
+        default=editor_mod.DEFAULT_PRE,
+        help="Seconds of normal speed before each marker (default: 3).",
+    )
+    p_edit.add_argument(
+        "--post",
+        type=float,
+        default=editor_mod.DEFAULT_POST,
+        help="Seconds of normal speed after each marker (default: 5).",
+    )
+    p_edit.add_argument(
+        "--speed",
+        type=float,
+        default=editor_mod.DEFAULT_SPEED,
+        help="Timelapse factor for the stretches between markers (default: 8).",
+    )
+    p_edit.add_argument(
+        "--font",
+        default=None,
+        help="Path to a .ttf font for captions (default: a system font).",
+    )
+    p_edit.set_defaults(func=cmd_edit)
+
     return parser
 
 
@@ -169,12 +210,27 @@ def cmd_live(args: argparse.Namespace) -> int:
     )
 
 
+def cmd_edit(args: argparse.Namespace) -> int:
+    session_dir = editor_mod.resolve_session_dir(
+        Path(args.sessions_root), args.session
+    )
+    output = editor_mod.run_edit(
+        session_dir,
+        pre=args.pre,
+        post=args.post,
+        speed=args.speed,
+        font=args.font,
+    )
+    print(f"Wrote {output}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except (SessionError, RecorderError) as exc:
+    except (SessionError, RecorderError, EditError) as exc:
         print(f"benchcam: {exc}", file=sys.stderr)
         return 1
 
