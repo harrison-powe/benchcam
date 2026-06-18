@@ -10,17 +10,21 @@ everything is saved as plain local files you can read with any text editor.
 
 - It records a session and logs markers (events with a timestamp + label).
 - It keeps everything in local files only. **No cloud sync.**
-- It can drive a recorder (OBS / ffmpeg, planned) to capture video.
+- It can drive a recorder to capture video (ffmpeg works on Windows; OBS planned).
 - It **does not** control any moving hardware or actuators. BenchCam may later
   receive external marker events, but it stays strictly on the observation side.
 
 v0 ships with a **NullRecorder** (records no video) so you can use and test the
-session + marker workflow immediately, with or without a camera. OBS and ffmpeg
-backends are stubbed with clear TODOs.
+session + marker workflow immediately, with or without a camera. The
+**FfmpegRecorder** records real video from a webcam on Windows (see
+[Recording video with ffmpeg](#recording-video-with-ffmpeg)); the OBS backend is
+still a stub.
 
 ## Requirements
 
 - Python 3.11 or newer.
+- For video recording: a working `ffmpeg` binary on your `PATH` (only needed if
+  you use `--recorder ffmpeg`; the default `null` recorder needs nothing extra).
 
 ## Install (Windows v0)
 
@@ -171,10 +175,54 @@ The "active" session is tracked by a small pointer file at
   session and marker workflow, and pairs well with capturing video manually in a
   separate app.
 - **ObsRecorder** (`obs`): stub. Planned to drive OBS Studio via obs-websocket.
-- **FfmpegRecorder** (`ffmpeg`): stub. Planned to capture via an `ffmpeg`
-  subprocess.
+- **FfmpegRecorder** (`ffmpeg`): records one video file per session by driving an
+  external `ffmpeg` binary. Windows (DirectShow / dshow) is the supported target;
+  see [Recording video with ffmpeg](#recording-video-with-ffmpeg).
 
-See `src/benchcam/recorders/` for the stub TODOs.
+See `src/benchcam/recorders/` for the recorder code.
+
+## Recording video with ffmpeg
+
+The `ffmpeg` recorder captures one video file, **`capture.mp4`**, into the
+session folder. It starts when the session starts, so the video timecode lines
+up with each marker's `elapsed_seconds`. ffmpeg is run as an external binary —
+BenchCam adds no Python ffmpeg dependency, so you must have `ffmpeg` on your
+`PATH` (`winget install Gyan.FFmpeg`, or download from
+[ffmpeg.org](https://ffmpeg.org/download.html) and add it to `PATH`).
+
+### 1. Find your camera's device name
+
+The DirectShow device name (for a Logitech C920S it is usually
+`HD Pro Webcam C920S`) must be passed exactly. List the devices on your machine:
+
+```powershell
+ffmpeg -list_devices true -f dshow -i dummy
+```
+
+Look under "DirectShow video devices" for the quoted name of your webcam.
+
+### 2. Start a session that records from the camera
+
+Pass the device name with `--camera`; it is stored in `session.json` and used as
+the source of truth for the device. (You can also set the `BENCHCAM_CAMERA`
+environment variable; an explicit `--camera` on the session wins.)
+
+```powershell
+benchcam new --recorder ffmpeg --camera "HD Pro Webcam C920S" --profile bench-a
+benchcam live
+```
+
+`benchcam live` (or `benchcam run`) launches ffmpeg in the background and returns
+immediately; quitting `live` (or `benchcam end`) sends `q` to ffmpeg so the MP4
+is finalized and playable, force-killing only if it does not exit in time. If
+`ffmpeg` is missing from `PATH`, or no camera name is configured, the command
+fails with a clear message instead of silently recording nothing.
+
+Defaults are tuned for the C920S: 1080p30 over MJPEG, H.264 (`libx264`), video
+only (no audio). An `ffmpeg.log` is written next to the video for troubleshooting.
+
+> POSIX note: Linux (v4l2) and macOS (avfoundation) input paths are marked TODO
+> in `build_ffmpeg_command`; Windows is the supported target for v0.
 
 ### 30-second manual test (Windows 11)
 
@@ -208,8 +256,9 @@ pytest
 ## Data and privacy
 
 - BenchCam writes only to your local `sessions\` directory.
-- Video/media files and the `sessions\` directory are **git-ignored** and must
-  not be committed.
+- Video/media files (including each session's `capture.mp4`) and the `sessions\`
+  directory are **git-ignored** and must not be committed. Video is large —
+  keep recordings on your external SSD, not in git.
 
 ## Project layout
 
@@ -225,7 +274,7 @@ src/benchcam/
         base.py       Recorder interface
         null.py       NullRecorder (default)
         obs.py        ObsRecorder stub
-        ffmpeg.py     FfmpegRecorder stub
+        ffmpeg.py     FfmpegRecorder (ffmpeg subprocess; Windows/dshow)
 tests/                unit tests
 ```
 
