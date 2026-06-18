@@ -34,6 +34,12 @@ DEFAULT_CAPTURE_STEM = "capture"
 DEFAULT_WAIT_TIMEOUT = 5.0  # seconds to wait for the file to appear / finalize
 DEFAULT_POLL_INTERVAL = 0.25
 
+# After a cross-filesystem copy, the writer (e.g. OBS) may still hold the source
+# file handle for a moment, so deleting the original can fail transiently. Retry
+# a few times over a couple of seconds before giving up.
+DEFAULT_DELETE_RETRIES = 5
+DEFAULT_DELETE_DELAY = 0.5  # seconds between delete attempts (~2s over 5 tries)
+
 _LOG = logging.getLogger("benchcam.recorders.collect")
 
 
@@ -56,14 +62,48 @@ def _wait_for_file(
         waited += interval
 
 
-def _move(src: Path, dst: Path) -> None:
+def _delete_with_retry(
+    path: Path,
+    *,
+    retries: int,
+    delay: float,
+    sleep: Callable[[float], None],
+) -> bool:
+    """Delete ``path``, retrying to give the writer time to release the handle.
+
+    Returns True if the file is gone (deleted now or already absent), False if
+    every attempt failed. Never raises.
+    """
+    for attempt in range(max(retries, 1)):
+        try:
+            os.remove(os.fspath(path))
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            if attempt < retries - 1:
+                sleep(delay)
+    return False
+
+
+def _move(
+    src: Path,
+    dst: Path,
+    *,
+    delete_retries: int,
+    delete_delay: float,
+    sleep: Callable[[float], None],
+    warn: Callable[[str], None],
+) -> None:
     """Move ``src`` to ``dst``, falling back to copy+delete across filesystems.
 
     A plain ``os.replace`` is atomic and fast on the same filesystem, but raises
     (EXDEV) across drives, so on any OSError we copy then remove the original.
     If the copy fails it propagates (so the caller can clean up and keep the
-    source); if only the source-delete fails, the video is already safely in the
-    session folder, so that is treated as success.
+    source). The original-delete is retried (the writer, e.g. OBS, may still hold
+    the handle just after StopRecord); if all retries fail the copy is still safe
+    in the session folder, so it is treated as success and the original is just
+    left in place with a warning.
     """
     try:
         os.replace(os.fspath(src), os.fspath(dst))
@@ -71,14 +111,13 @@ def _move(src: Path, dst: Path) -> None:
     except OSError:
         pass
     shutil.copy2(os.fspath(src), os.fspath(dst))
-    try:
-        os.remove(os.fspath(src))
-    except OSError:
-        _LOG.warning(
-            "Copied recording into %s but could not delete the original %s; "
-            "leaving the original in place.",
-            dst,
-            src,
+    if not _delete_with_retry(
+        src, retries=delete_retries, delay=delete_delay, sleep=sleep
+    ):
+        warn(
+            f"Copied recording into {dst} but could not delete the original "
+            f"{src} after {delete_retries} attempts; leaving the original in "
+            "place."
         )
 
 
@@ -89,6 +128,8 @@ def collect_recording(
     capture_stem: str = DEFAULT_CAPTURE_STEM,
     wait_timeout: float = DEFAULT_WAIT_TIMEOUT,
     poll_interval: float = DEFAULT_POLL_INTERVAL,
+    delete_retries: int = DEFAULT_DELETE_RETRIES,
+    delete_delay: float = DEFAULT_DELETE_DELAY,
     sleep: Callable[[float], None] = time.sleep,
     warn: Callable[[str], None] | None = None,
 ) -> Path | None:
@@ -124,7 +165,14 @@ def collect_recording(
     dest = storage_path / f"{capture_stem}{source.suffix}"
     try:
         storage_path.mkdir(parents=True, exist_ok=True)
-        _move(source, dest)
+        _move(
+            source,
+            dest,
+            delete_retries=delete_retries,
+            delete_delay=delete_delay,
+            sleep=sleep,
+            warn=warn,
+        )
     except OSError as exc:
         warn(
             f"Could not move recording {source} -> {dest}: {exc}. Leaving the "

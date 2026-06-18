@@ -185,11 +185,13 @@ A free-form Markdown file for whatever you want to jot down during the session.
 | `benchcam mark "label"` | Append a time-stamped marker to the active session. |
 | `benchcam live` | Open an interactive shell that marks the active session on a single keypress. |
 | `benchcam end` | Stop recording and close the active session. |
+| `benchcam edit` | Render a marker-aware `review.mp4` (timelapse + normal-speed marker windows + captions). |
 
 Useful options:
 
 - `benchcam new --profile NAME --camera DESC --microphone DESC --recorder {null,obs,ffmpeg} --notes "..."`
 - `benchcam mark "label" --source external`
+- `benchcam edit --session ID --pre 3 --post 5 --speed 8 --font PATH`
 - `--sessions-root PATH` (on any command) to use a different sessions directory.
 
 The "active" session is tracked by a small pointer file at
@@ -322,6 +324,50 @@ After the session, the OBS video is `sessions\<id>\capture.mkv` (or `.mp4`) next
 to `markers.csv`, `obs_recording.txt` records its final path, and the marker
 `elapsed_seconds` values map directly onto that recording's timecode.
 
+## Auto-editing a review clip (`benchcam edit`)
+
+`benchcam edit` turns a recorded session into a YouTube-ready "build log"
+`review.mp4` with no manual editing:
+
+- The stretches between markers are **timelapsed** (default `--speed 8` for 8x).
+- Around each marker the clip drops to **normal speed** for a window — default
+  `--pre 3` seconds before and `--post 5` seconds after. Overlapping or adjacent
+  windows merge into one normal-speed segment.
+- **Audio** is kept in the normal-speed windows (your narration) and dropped in
+  the timelapsed stretches (no chipmunk audio).
+- Each marker that has a **label** gets that label burned on screen as a caption
+  during its normal-speed window.
+
+It reads the session's `capture.*` and `markers.csv` and writes `review.mp4` into
+the **same** session folder. It needs `ffmpeg` (and `ffprobe`, which ships with
+ffmpeg) on your `PATH` — see [Recording video with ffmpeg](#recording-video-with-ffmpeg)
+for install instructions.
+
+```powershell
+# Edit the newest session with the defaults (3s pre / 5s post / 8x):
+benchcam edit
+
+# ...or a specific session, with custom pacing:
+benchcam edit --session 2026-06-18_05-43-00 --pre 2 --post 6 --speed 12
+
+# Custom caption font (optional):
+benchcam edit --font "C:\Windows\Fonts\arial.ttf"
+```
+
+`benchcam edit` first prints the **segment plan** (which stretches are timelapsed
+vs. normal speed, and which captions land where) so you can sanity-check the
+pacing before watching, then renders `sessions\<id>\review.mp4`. Re-running
+overwrites `review.mp4` cleanly; `capture.*` is never modified or deleted.
+
+Notes:
+
+- **No markers** → a straight `--speed` timelapse of the whole video (still a
+  quick way to skim a session); `edit` says so.
+- Marker times past the end of the video are clamped to its length.
+- If `capture.*` is missing (e.g. an OBS session where collection failed and only
+  `obs_recording.txt` remains), `edit` follows that pointer to the original file;
+  if it still can't be found, it fails with a clear message.
+
 ### 30-second manual test (Windows 11)
 
 From the project folder, in PowerShell, with BenchCam installed:
@@ -363,11 +409,12 @@ pytest
 
 ```
 src/benchcam/
-    cli.py            argparse CLI (new/run/mark/live/end)
+    cli.py            argparse CLI (new/run/mark/live/end/edit)
     session.py        session model + on-disk layout
     markers.py        markers.csv reading/writing
     live.py           interactive single-keypress marking shell
     keypress.py       cross-platform single-key reader (msvcrt / termios)
+    editor.py         marker-aware auto-edit -> review.mp4 (ffmpeg)
     clock.py          time helpers
     recorders/
         base.py       Recorder interface
