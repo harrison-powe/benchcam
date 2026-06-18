@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -211,22 +212,54 @@ def describe_plan(
 # --------------------------------------------------------------------------- #
 
 def _escape_drawtext(text: str) -> str:
-    """Escape label text for an ffmpeg drawtext value wrapped in single quotes."""
-    text = text.replace("\n", " ").replace("\r", " ")
-    # Inside '...' everything is literal except a single quote, which must be
-    # closed and re-opened around an escaped quote.
-    return text.replace("'", r"'\''")
+    r"""Escape label text for an ffmpeg drawtext ``text=`` value in a filtergraph.
+
+    The value passes through two parser levels (the filtergraph parser, then
+    drawtext's own ``:``-separated option parser), so characters special to
+    either level must survive both:
+
+    - ``\`` -> ``\\\\`` (literal backslash)
+    - ``:`` -> ``\\:``   (drawtext option separator)
+    - ``'`` -> ``\'``    (filtergraph quote)
+    - ``,`` ``;`` ``[`` ``]`` -> ``\<char>`` (filtergraph separators / pad refs)
+    - ``%`` -> ``\%``    (drawtext text expansion; we also pass expansion=none)
+
+    Verified against ffmpeg by rendering labels like ``it's 3:00`` and
+    ``path C:\\tmp``.
+    """
+    text = text.replace("\r", " ").replace("\n", " ")
+    out: list[str] = []
+    for ch in text:
+        if ch == "\\":
+            out.append("\\\\\\\\")
+        elif ch == ":":
+            out.append("\\\\:")
+        elif ch == "'":
+            out.append("\\'")
+        elif ch in ",;[]":
+            out.append("\\" + ch)
+        elif ch == "%":
+            out.append("\\%")
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
-def _fontfile_arg(fontfile: str) -> str:
-    """Format a font path for a filtergraph (forward slashes, escaped drive colon)."""
-    return str(fontfile).replace("\\", "/").replace(":", "\\:")
+def _escape_fontfile(fontfile: str) -> str:
+    r"""Escape a font path for a drawtext ``fontfile=`` value in a filtergraph.
+
+    Backslashes become forward slashes (valid for ffmpeg on Windows) and the
+    drive-letter colon is escaped so it survives both filtergraph parsing levels,
+    e.g. ``C:\Windows\Fonts\arial.ttf`` -> ``C\\:/Windows/Fonts/arial.ttf``.
+    """
+    return str(fontfile).replace("\\", "/").replace(":", "\\\\:")
 
 
 def _drawtext_filter(caption: Caption, fontfile: str | None) -> str:
-    parts = [f"text='{_escape_drawtext(caption.text)}'"]
+    # expansion=none keeps labels literal (no %{...} expansion / "Stray %").
+    parts = [f"text={_escape_drawtext(caption.text)}", "expansion=none"]
     if fontfile:
-        parts.append(f"fontfile={_fontfile_arg(fontfile)}")
+        parts.append(f"fontfile={_escape_fontfile(fontfile)}")
     parts += [
         "fontcolor=white",
         "fontsize=36",
@@ -235,35 +268,32 @@ def _drawtext_filter(caption: Caption, fontfile: str | None) -> str:
         "boxborderw=12",
         "x=(w-tw)/2",
         "y=h-th-60",
-        f"enable='between(t,{caption.start:.3f},{caption.end:.3f})'",
+        # Escape the commas so the filtergraph parser keeps them inside between().
+        f"enable=between(t\\,{caption.start:.3f}\\,{caption.end:.3f})",
     ]
     return "drawtext=" + ":".join(parts)
 
 
-def build_ffmpeg_edit_command(
-    input_path: Path | str,
-    output_path: Path | str,
+def build_filter_complex(
     plan: list[Segment],
     *,
-    ffmpeg: str = "ffmpeg",
     fontfile: str | None = None,
     has_audio: bool = True,
-) -> list[str]:
-    """Build the ffmpeg command (filter_complex) that renders the review clip.
+) -> str:
+    """Build the filtergraph string for the review clip (pure, testable).
 
-    Pure and side-effect free for unit testing. Input 0 is the capture video;
-    input 1 is a silent ``anullsrc`` used for timelapsed (and audio-less) audio
-    so every concatenated segment has a matching audio stream.
+    Input 0 is the capture video; input 1 is a silent ``anullsrc`` used for
+    timelapsed (and audio-less) segments so every concatenated segment has a
+    matching audio stream.
     """
     if not plan:
-        raise EditError("Cannot build an edit command from an empty segment plan.")
+        raise EditError("Cannot build a filtergraph from an empty segment plan.")
 
     chains: list[str] = []
     concat_inputs: list[str] = []
 
     for k, seg in enumerate(plan):
         s, e = seg.start, seg.end
-        # Video.
         vfilters = [f"trim=start={s:.3f}:end={e:.3f}"]
         if seg.normal:
             vfilters.append("setpts=PTS-STARTPTS")
@@ -273,8 +303,6 @@ def build_ffmpeg_edit_command(
             vfilters.append(f"setpts=(PTS-STARTPTS)/{seg.speed:g}")
         chains.append(f"[0:v]{','.join(vfilters)}[v{k}]")
 
-        # Audio: real audio only for normal segments of a video that has audio;
-        # otherwise silence sized to the segment's output duration.
         if seg.normal and has_audio:
             chains.append(
                 f"[0:a]atrim=start={s:.3f}:end={e:.3f},asetpts=PTS-STARTPTS[a{k}]"
@@ -287,12 +315,23 @@ def build_ffmpeg_edit_command(
 
         concat_inputs.append(f"[v{k}][a{k}]")
 
-    concat = (
-        "".join(concat_inputs)
-        + f"concat=n={len(plan)}:v=1:a=1[outv][outa]"
-    )
-    filter_complex = ";".join(chains + [concat])
+    concat = "".join(concat_inputs) + f"concat=n={len(plan)}:v=1:a=1[outv][outa]"
+    return ";".join(chains + [concat])
 
+
+def build_ffmpeg_edit_command(
+    input_path: Path | str,
+    output_path: Path | str,
+    filter_script_path: Path | str,
+    *,
+    ffmpeg: str = "ffmpeg",
+) -> list[str]:
+    """Build the ffmpeg argv that renders the review clip from a filterscript.
+
+    The filtergraph is read from ``filter_script_path`` via
+    ``-filter_complex_script`` rather than inline, which sidesteps command-line
+    length limits and shell-escaping pain for long graphs.
+    """
     return [
         ffmpeg,
         "-y",
@@ -303,8 +342,8 @@ def build_ffmpeg_edit_command(
         "lavfi",
         "-i",
         "anullsrc=channel_layout=stereo:sample_rate=44100",
-        "-filter_complex",
-        filter_complex,
+        "-filter_complex_script",
+        str(filter_script_path),
         "-map",
         "[outv]",
         "-map",
@@ -431,17 +470,29 @@ def find_capture(session_dir: Path) -> Path:
 
 
 def _resolve_font(font: str | None) -> str | None:
+    """Pick a font file that actually exists, else None (drawtext default).
+
+    The requested ``font`` is preferred but only if it exists; otherwise we fall
+    back to a known system font, and finally to no explicit fontfile so the
+    render never dies on a missing font.
+    """
+    candidates: list[str] = []
     if font:
-        return font
+        candidates.append(font)
     if os.name == "nt":
-        candidates = [r"C:\Windows\Fonts\arial.ttf", r"C:\Windows\Fonts\segoeui.ttf"]
+        candidates += [
+            r"C:\Windows\Fonts\arial.ttf",
+            r"C:\Windows\Fonts\segoeui.ttf",
+            r"C:\Windows\Fonts\calibri.ttf",
+        ]
     else:
-        candidates = [
+        candidates += [
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
             "/Library/Fonts/Arial.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
         ]
     for candidate in candidates:
-        if Path(candidate).exists():
+        if candidate and Path(candidate).exists():
             return candidate
     return None  # let ffmpeg fall back to its default font
 
@@ -494,10 +545,27 @@ def run_edit(
 
     output = session_dir / OUTPUT_FILENAME
     fontfile = _resolve_font(font)
-    command = build_ffmpeg_edit_command(
-        capture, output, plan, ffmpeg=ffmpeg, fontfile=fontfile, has_audio=has_audio
-    )
-    result = run_ffmpeg_command(command)
+    filter_complex = build_filter_complex(plan, fontfile=fontfile, has_audio=has_audio)
+
+    # Pass the (potentially long, escaping-heavy) graph via a temp filterscript
+    # rather than inline, then clean it up — only review.mp4 is left behind.
+    script_path: Path | None = None
+    try:
+        fd, name = tempfile.mkstemp(prefix="benchcam-edit-", suffix=".ffscript")
+        script_path = Path(name)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(filter_complex)
+        command = build_ffmpeg_edit_command(
+            capture, output, script_path, ffmpeg=ffmpeg
+        )
+        result = run_ffmpeg_command(command)
+    finally:
+        if script_path is not None:
+            try:
+                script_path.unlink()
+            except OSError:
+                pass
+
     if result.returncode != 0:
         tail = "\n".join((result.stderr or "").strip().splitlines()[-8:])
         raise EditError(f"ffmpeg failed to render {output}:\n{tail}")

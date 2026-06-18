@@ -354,6 +354,14 @@ benchcam edit --session 2026-06-18_05-43-00 --pre 2 --post 6 --speed 12
 benchcam edit --font "C:\Windows\Fonts\arial.ttf"
 ```
 
+Captions are rendered by ffmpeg's `drawtext`. BenchCam escapes the caption text
+and the font path for ffmpeg's filtergraph automatically (so Windows paths like
+`C:\Windows\Fonts\arial.ttf` and labels containing `:`, `'`, `,`, `\`, or `%`
+render correctly), and passes the filtergraph via a temp filterscript. If the
+chosen `--font` isn't found, it falls back to a common system font (Arial on
+Windows), and finally to ffmpeg's default — the render never dies on a missing
+font. By default captions use `arial.ttf` on Windows; pass `--font` to override.
+
 `benchcam edit` first prints the **segment plan** (which stretches are timelapsed
 vs. normal speed, and which captions land where) so you can sanity-check the
 pacing before watching, then renders `sessions\<id>\review.mp4`. Re-running
