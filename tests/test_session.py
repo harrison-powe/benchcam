@@ -144,6 +144,92 @@ def test_load_old_session_without_name_falls_back_to_folder(tmp_path):
     assert loaded.display_name == loaded.session_id
 
 
+def test_rename_session_renames_folder_keeps_timestamp_updates_metadata(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        session_mod.clock, "folder_timestamp", lambda dt: "2026-06-18_14-41-31"
+    )
+    root = tmp_path / "sessions"
+    s = session_mod.create_session(root=root, name="old name")
+    session_mod.start_session(s)
+    session_mod.end_session(s)
+    old_folder = s.folder
+    # A collected video + an obs pointer that references inside the folder.
+    (old_folder / "capture.mkv").write_bytes(b"v")
+    (old_folder / "obs_recording.txt").write_text(
+        str(old_folder / "capture.mkv"), encoding="utf-8"
+    )
+
+    renamed = session_mod.rename_session(old_folder, "New Shiny Name!")
+
+    assert renamed.session_id == "2026-06-18_14-41-31_new-shiny-name"
+    assert renamed.session_id.startswith("2026-06-18_14-41-31")  # timestamp kept
+    assert renamed.name == "New Shiny Name!"
+    assert not old_folder.exists()
+    new_folder = renamed.folder
+    assert new_folder.exists()
+    # session.json updated in the new folder
+    data = json.loads((new_folder / "session.json").read_text(encoding="utf-8"))
+    assert data["name"] == "New Shiny Name!"
+    assert data["session_id"] == renamed.session_id
+    # contents moved with the folder; obs pointer repointed into the new folder
+    assert (new_folder / "capture.mkv").exists()
+    assert (new_folder / "obs_recording.txt").read_text(encoding="utf-8").strip() == str(
+        new_folder / "capture.mkv"
+    )
+
+
+def test_rename_running_session_is_refused(tmp_path):
+    root = tmp_path / "sessions"
+    s = session_mod.create_session(root=root, name="x")
+    session_mod.start_session(s)  # running
+    with pytest.raises(SessionError):
+        session_mod.rename_session(s.folder, "y")
+
+
+def test_rename_collision_appends_suffix(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        session_mod.clock, "folder_timestamp", lambda dt: "2026-06-18_10-00-00"
+    )
+    root = tmp_path / "sessions"
+    a = session_mod.create_session(root=root, name="alpha")
+    session_mod.end_session(a)
+    b = session_mod.create_session(root=root, name="beta")
+    session_mod.end_session(b)
+
+    renamed = session_mod.rename_session(b.folder, "alpha")  # would collide with a
+
+    assert renamed.session_id != a.session_id
+    assert renamed.session_id.startswith("2026-06-18_10-00-00_alpha")
+    assert a.folder.exists()  # not overwritten
+
+
+def test_rename_updates_active_pointer(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        session_mod.clock, "folder_timestamp", lambda dt: "2026-06-18_09-00-00"
+    )
+    root = tmp_path / "sessions"
+    s = session_mod.create_session(root=root, name="x")  # also sets .active
+    session_mod.end_session(s)
+
+    renamed = session_mod.rename_session(s.folder, "y")
+
+    active = session_mod.get_active_session(root)  # follows the (repointed) pointer
+    assert active.session_id == renamed.session_id
+
+
+def test_rename_to_empty_name_becomes_timestamp_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        session_mod.clock, "folder_timestamp", lambda dt: "2026-06-18_08-00-00"
+    )
+    root = tmp_path / "sessions"
+    s = session_mod.create_session(root=root, name="had a name")
+    session_mod.end_session(s)
+
+    renamed = session_mod.rename_session(s.folder, "")
+    assert renamed.session_id == "2026-06-18_08-00-00"
+    assert renamed.name == ""
+
+
 def test_cannot_start_ended_session(tmp_path):
     root = tmp_path / "sessions"
     session = session_mod.create_session(root=root)

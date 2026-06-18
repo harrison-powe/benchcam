@@ -34,6 +34,9 @@ ACTIVE_POINTER_NAME = ".active"
 SESSION_FILENAME = "session.json"
 MARKERS_FILENAME = "markers.csv"
 NOTES_FILENAME = "notes.md"
+# Sidecar written by the OBS recorder; repointed on folder rename if it points
+# inside the session folder. (Kept here to avoid importing a recorder module.)
+OBS_POINTER_FILENAME = "obs_recording.txt"
 
 STATUS_CREATED = "created"
 STATUS_RUNNING = "running"
@@ -213,6 +216,85 @@ def get_active_session(root: Path = DEFAULT_SESSIONS_ROOT) -> Session:
             f"Active session points to {folder}, but that folder is missing."
         )
     return load_session(folder)
+
+
+def _timestamp_prefix(session: Session, folder: Path) -> str:
+    """The original ``YYYY-MM-DD_HH-MM-SS`` prefix to keep across a rename."""
+    try:
+        return clock.folder_timestamp(clock.from_iso(session.created_wall_time))
+    except (TypeError, ValueError):
+        # Fall back to the date_time portion of the existing folder name.
+        parts = folder.name.split("_")
+        return "_".join(parts[:2]) if len(parts) >= 2 else folder.name
+
+
+def _fix_active_pointer(root: Path, old_name: str, new_name: str) -> None:
+    pointer = _active_pointer(root)
+    try:
+        if pointer.exists() and pointer.read_text(encoding="utf-8").strip() == old_name:
+            pointer.write_text(new_name + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _repoint_obs_pointer(old_folder: Path, new_folder: Path) -> None:
+    """If obs_recording.txt pointed inside the old folder, repoint it.
+
+    External paths (OBS's own recording folder, when collect failed) are left
+    untouched — the video really is over there.
+    """
+    pointer = Path(new_folder) / OBS_POINTER_FILENAME
+    try:
+        if not pointer.exists():
+            return
+        target = Path(pointer.read_text(encoding="utf-8").strip())
+    except OSError:
+        return
+    try:
+        rel = target.relative_to(old_folder)
+    except ValueError:
+        return  # points outside the session folder; leave it
+    try:
+        pointer.write_text(str(Path(new_folder) / rel) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def rename_session(folder: Path, new_name: str) -> Session:
+    """Rename an ended session's folder to ``<timestamp>_<new-slug>`` on disk.
+
+    Keeps the original timestamp prefix (for sorting/uniqueness); only the slug
+    changes. Updates session.json's name/session_id/storage_path and repoints the
+    ``.active`` pointer and ``obs_recording.txt`` if they referenced the folder.
+    Refuses a running session and handles target-name collisions by appending a
+    numeric suffix. capture.*/markers.csv/notes.md/review.mp4 move with the
+    folder. Returns the updated Session.
+    """
+    folder = Path(folder)
+    session = load_session(folder)
+    if session.status == STATUS_RUNNING:
+        raise SessionError(
+            f"Session {session.session_id} is still running; end it before renaming."
+        )
+
+    root = folder.parent
+    timestamp = _timestamp_prefix(session, folder)
+    slug = slugify(new_name)
+    new_folder_name = f"{timestamp}_{slug}" if slug else timestamp
+    target = root / new_folder_name
+
+    if target != folder:
+        if target.exists():
+            target = _unique_folder(root, new_folder_name)
+        folder.rename(target)
+        _fix_active_pointer(root, folder.name, target.name)
+        _repoint_obs_pointer(folder, target)
+
+    session.name = (new_name or "").strip()
+    session.storage_path = str(target)
+    session.session_id = target.name
+    session.save()
+    return session
 
 
 def start_session(session: Session) -> Session:
