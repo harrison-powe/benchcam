@@ -302,16 +302,24 @@ class DashboardController:
         return {"opened": str(folder)}
 
     def rename(self, session: str, name: str) -> dict:
-        """Set the friendly name in session.json (folder stays stable)."""
+        """Rename an ended session's folder (and metadata) to reflect the name.
+
+        Refuses the currently active/recording session — only ended sessions can
+        be renamed, since renaming moves the folder on disk.
+        """
         folder = self._resolve_session_dir(session)
-        loaded = session_mod.load_session(folder)
-        loaded.name = (name or "").strip()
-        loaded.save()
-        # Keep an in-memory copy in sync if it's the active/last session.
-        for ref in (self._session, self._last_session):
-            if ref is not None and ref.session_id == loaded.session_id:
-                ref.name = loaded.name
-        return {"session_id": loaded.session_id, "name": loaded.display_name}
+        if self._session is not None and self._session.session_id == folder.name:
+            raise DashboardError(
+                "Can't rename the active session while it's recording — stop it first."
+            )
+        renamed = session_mod.rename_session(folder, name)
+        # Keep the in-memory 'last session' reference pointing at the new folder.
+        if (
+            self._last_session is not None
+            and self._last_session.storage_path == str(folder)
+        ):
+            self._last_session = renamed
+        return {"session_id": renamed.session_id, "name": renamed.display_name}
 
     # -- helpers -------------------------------------------------------------
     def _render_review(self, folder, pre, post, speed) -> dict:
@@ -1096,6 +1104,7 @@ function libraryRow(s){
   const nm = document.createElement("input");
   nm.className = "nm"; nm.value = s.name; nm.dataset.id = s.session_id;
   nm.title = "session id: " + s.session_id;
+  nm.disabled = s.active;  // can't rename the folder of a recording session
   const saveName = () => api("/api/rename", {session: s.session_id, name: nm.value}).then(loadLibrary);
   nm.addEventListener("keydown", ev => { if (ev.key === "Enter"){ ev.preventDefault(); saveName(); nm.blur(); }});
   nm.addEventListener("change", saveName);

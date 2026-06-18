@@ -502,17 +502,34 @@ def test_make_review_for_session_runs_edit_and_opens(tmp_path, monkeypatch):
     assert opened["p"].endswith("review.mp4")
 
 
-def test_rename_sets_name_without_renaming_folder(tmp_path):
+def test_rename_ended_session_renames_folder(tmp_path):
     root = tmp_path / "sessions"
     s = session_mod.create_session(root=root, name="old")
-    folder = s.folder
+    session_mod.start_session(s)
+    session_mod.end_session(s)
+    old_id = s.session_id
+    old_folder = s.folder
     ctrl = DashboardController(root, config_root=tmp_path)
 
-    res = ctrl.rename(s.session_id, "New Name")
+    res = ctrl.rename(old_id, "New Name")
+
     assert res["name"] == "New Name"
-    assert folder.exists() and folder.name == s.session_id  # folder unchanged
-    reloaded = session_mod.load_session(folder)
-    assert reloaded.name == "New Name"
+    assert res["session_id"].endswith("_new-name")
+    assert res["session_id"].startswith(old_id.split("_")[0])  # timestamp kept
+    assert not old_folder.exists()                 # folder actually moved
+    new_folder = root / res["session_id"]
+    assert new_folder.exists()
+    assert session_mod.load_session(new_folder).name == "New Name"
+
+
+def test_rename_active_session_is_refused(monkeypatch, root):
+    _use_recorder(monkeypatch, FakeRecorder())
+    ctrl = DashboardController(root)
+    started = ctrl.start("null", "p", name="live one")
+    with pytest.raises(DashboardError):
+        ctrl.rename(started["session_id"], "nope")
+    # still active and unrenamed
+    assert session_mod.get_active_session(root).session_id == started["session_id"]
 
 
 def test_open_folder_opens_session_dir(tmp_path, monkeypatch):

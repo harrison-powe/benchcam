@@ -409,8 +409,12 @@ first) showing the name, date/time, marker count, length, and whether a
 `review.mp4` exists. Per row you can **Open video** (the capture in your default
 player), **Make review** / **Open review** (render with the `pre`/`post`/`speed`
 controls, or open the existing one), **Open folder** (in the file explorer), and
-rename the session inline (this updates `session.json`; the folder stays put).
-The library just scans the session folders — there's no separate database.
+rename the session inline. Renaming an **ended** session **renames the folder on
+disk** to `<original-timestamp>_<new-slug>` (the timestamp prefix is kept) and
+updates `session.json` (and repoints `obs_recording.txt`/`.active` if needed), so
+File Explorer reflects the new name. The currently recording session can't be
+renamed — stop it first. The library just scans the session folders — there's no
+separate database.
 
 > The dashboard's MARK button is a click convenience. For hands-busy marking,
 > `benchcam live` in a terminal (single keypress per marker) is still the fastest
