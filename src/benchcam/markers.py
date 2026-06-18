@@ -79,3 +79,28 @@ def append_marker(path: Path, marker: Marker) -> None:
         if not file_exists:
             writer.writeheader()
         writer.writerow(marker.as_row())
+
+
+def set_marker_label(path: Path, marker_index: int, label: str) -> bool:
+    """Set the label of an existing marker (by index) and rewrite ``markers.csv``.
+
+    Lets a marker be created instantly (no label) and labeled afterward. Only the
+    ``label`` field changes; the columns and the other values (including the
+    formatted ``elapsed_seconds`` text) are preserved exactly. Returns True if a
+    matching marker was found and updated.
+    """
+    path = Path(path)
+    rows = read_markers(path)
+    found = False
+    for row in rows:
+        if str(row.get("marker_index")) == str(marker_index):
+            row["label"] = label
+            found = True
+    if not found:
+        return False
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=FIELDNAMES)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in FIELDNAMES})
+    return True

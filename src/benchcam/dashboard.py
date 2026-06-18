@@ -6,7 +6,8 @@ endpoints that drive the EXISTING BenchCam logic — it does not reimplement
 sessions, markers, recorders, collect, or edit:
 
     start   -> session.create_session + recorder.start + session.start_session
-    mark    -> session.add_marker
+    mark    -> session.add_marker (instant; label optional)
+    label   -> markers.set_marker_label (label/relabel an existing marker)
     note    -> append a line to notes.md
     stop    -> recorder.stop (collect happens inside the OBS recorder) +
                session.end_session
@@ -34,7 +35,7 @@ from . import config as config_mod
 from . import editor as editor_mod
 from . import session as session_mod
 from .editor import EditError
-from .markers import read_markers
+from .markers import read_markers, set_marker_label
 from .recorders import get_recorder
 from .recorders.base import RecorderError
 from .recorders.obs import ENV_HOST, ENV_PASSWORD, ENV_PORT
@@ -175,15 +176,50 @@ class DashboardController:
             }
         session = self._session
         recorder = self._recorder
+
+        # Stop the recorder (for OBS this sends StopRecord and collects the video
+        # into the session folder). If it fails — e.g. OBS was already stopped
+        # manually — record the warning but still end the session cleanly so the
+        # UI never stays stuck "RECORDING".
+        warning = None
         try:
             if recorder is not None:
-                recorder.stop()  # OBS recorder collects the video here
-            session_mod.end_session(session)
-        finally:
-            self._session = None
-            self._recorder = None
+                recorder.stop()
+        except Exception as exc:  # noqa: BLE001 - never block the end transition
+            warning = f"Recorder stop reported: {exc}"
+
+        try:
+            session_mod.end_session(session)  # status -> ended, stamps ended time
+        except SessionError:
+            pass  # already ended; still fine
+
+        self._session = None
+        self._recorder = None
         self._last_session = session
-        return {"active": False, "stopped": True, "summary": self._summary(session)}
+
+        result = {
+            "active": False,
+            "stopped": True,
+            "summary": self._summary(session),
+        }
+        if warning:
+            result["warning"] = warning
+        return result
+
+    def label_marker(self, index, label: str = "") -> dict:
+        """Set/edit the label of an existing marker (mark first, label after)."""
+        session = self._session or self._last_session
+        if session is None:
+            raise DashboardError("No session with markers to label.")
+        try:
+            marker_index = int(index)
+        except (TypeError, ValueError) as exc:
+            raise DashboardError(f"Invalid marker index {index!r}.") from exc
+        if not set_marker_label(session.markers_file, marker_index, label or ""):
+            raise DashboardError(f"Marker #{marker_index} not found.")
+        if self._session is not None:
+            return {"labeled": marker_index, **self.status()}
+        return {"labeled": marker_index}
 
     def review(
         self,
@@ -363,6 +399,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 obs_port=p.get("obs_port") or None,
             ),
             "/api/mark": lambda p: self.controller.mark(p.get("label", "")),
+            "/api/label": lambda p: self.controller.label_marker(
+                p.get("index"), p.get("label", "")
+            ),
             "/api/note": lambda p: self.controller.note(p.get("text", "")),
             "/api/stop": lambda p: self.controller.stop(),
             "/api/review": lambda p: self.controller.review(
@@ -549,7 +588,14 @@ PAGE_HTML = """<!doctype html>
       <div style="flex:3"><input id="note" placeholder="add a note to notes.md" /></div>
       <div style="flex:1"><button id="noteBtn" class="ghost">Add note</button></div>
     </div>
-    <p class="hint">Hands busy? <code>benchcam live</code> in a terminal is the fastest single-keypress marking path.</p>
+    <p class="hint">Tip: just hit <b>MARK now</b> (or <b>Space</b>) the instant something happens —
+       you can type the label onto that row afterward, in the Markers list below.</p>
+    <p class="hint" id="legend">Keyboard (when not typing in a field):
+       <b>Space</b>/<b>Enter</b> = mark now &middot;
+       <b>L</b> = label the last marker &middot;
+       <b>N</b> = add note &middot;
+       <b>Q</b> = stop session.
+       For hands-busy marking, <code>benchcam live</code> in a terminal is still fastest.</p>
     <div style="margin-top:14px"><button id="stopBtn" class="big stop">Stop session</button></div>
   </div>
 
@@ -595,7 +641,11 @@ async function api(path, body) {
   return data;
 }
 
+let current = {active: false};
+let renderedCount = -1;
+
 function render(s) {
+  current = s;
   const active = s.active;
   $("state").className = "state " + (active ? "rec" : "idle");
   $("stateText").textContent = active ? "● RECORDING" : "○ IDLE";
@@ -608,12 +658,9 @@ function render(s) {
     $("folder").textContent = s.folder;
     $("elapsed").textContent = (s.elapsed_seconds||0).toFixed(1) + "s";
     $("count").textContent = s.marker_count||0;
-    const tb = $("markers"); tb.innerHTML = "";
-    (s.markers||[]).slice().reverse().forEach(m => {
-      const tr = document.createElement("tr");
-      tr.innerHTML = `<td>${m.index}</td><td>${m.elapsed.toFixed(2)}s</td><td>${escapeHtml(m.label||"")}</td>`;
-      tb.appendChild(tr);
-    });
+    renderMarkers(s.markers||[]);
+  } else {
+    renderedCount = -1;  // start the next session's table fresh
   }
   // review card: show when there is a finished session
   const last = s.last_session;
@@ -624,6 +671,51 @@ function render(s) {
       + `<code>${last.folder}</code>`;
   }
   if (s.last_review) $("reviewOut").textContent = "review.mp4: " + s.last_review;
+}
+
+// Rebuild the markers table only when the count changes, so the 1s status poll
+// never wipes a label you're mid-typing. Focus/caret are preserved across the
+// occasional rebuild.
+function renderMarkers(markers) {
+  if (markers.length === renderedCount) return;
+  const tb = $("markers");
+  const act = document.activeElement;
+  const focusIdx = (act && act.classList && act.classList.contains("lbl")) ? act.dataset.index : null;
+  const caret = (focusIdx != null) ? act.selectionStart : null;
+  renderedCount = markers.length;
+  tb.innerHTML = "";
+  markers.slice().reverse().forEach(m => {
+    const tr = document.createElement("tr");
+    const tdN = document.createElement("td"); tdN.textContent = m.index;
+    const tdE = document.createElement("td"); tdE.textContent = m.elapsed.toFixed(2) + "s";
+    const tdL = document.createElement("td");
+    const inp = document.createElement("input");
+    inp.className = "lbl"; inp.dataset.index = m.index;
+    inp.value = m.label || ""; inp.placeholder = "add label";
+    inp.addEventListener("keydown", ev => {
+      if (ev.key === "Enter") { ev.preventDefault(); saveLabel(m.index, inp.value); inp.blur(); }
+    });
+    inp.addEventListener("change", () => saveLabel(m.index, inp.value));
+    tdL.appendChild(inp);
+    tr.appendChild(tdN); tr.appendChild(tdE); tr.appendChild(tdL);
+    tb.appendChild(tr);
+  });
+  if (focusIdx != null) {
+    const sel = tb.querySelector('input.lbl[data-index="' + focusIdx + '"]');
+    if (sel) { sel.focus(); if (caret != null) { try { sel.setSelectionRange(caret, caret); } catch(e){} } }
+  }
+}
+
+async function saveLabel(index, value) {
+  const d = await api("/api/label", {index: index, label: value});
+  if (d.ok && d.marker_count !== undefined) { current = d; $("count").textContent = d.marker_count; }
+}
+
+async function doMark() { const d = await api("/api/mark", {label: ""}); if (d.ok) render(d); }
+
+function focusLastLabel() {
+  const first = $("markers").querySelector("input.lbl");  // reversed => most recent first
+  if (first) { first.focus(); first.select(); }
 }
 
 function escapeHtml(t){return t.replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
@@ -660,18 +752,36 @@ $("startBtn").onclick = async () => {
   $("startBtn").disabled = false;
   if (d.ok) { $("obsPassword").value = ""; render(d); }
 };
-$("markBtn").onclick = async () => { const d = await api("/api/mark", {label: ""}); if (d.ok) render(d); };
+$("markBtn").onclick = doMark;
 $("markLabelBtn").onclick = async () => {
   const d = await api("/api/mark", {label: $("label").value}); if (d.ok) { $("label").value=""; render(d); }
 };
+$("label").addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); $("markLabelBtn").click(); }});
 $("noteBtn").onclick = async () => {
   const d = await api("/api/note", {text: $("note").value}); if (d.ok) $("note").value="";
 };
+$("note").addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); $("noteBtn").click(); }});
+
+// Keyboard shortcuts — only when a session is active and you're NOT typing in a
+// field, so spacebar-mark never fires while you're entering a label or note.
+document.addEventListener("keydown", (e) => {
+  const t = e.target;
+  const tag = ((t && t.tagName) || "").toLowerCase();
+  const typing = tag === "input" || tag === "textarea" || tag === "select" || (t && t.isContentEditable);
+  if (typing) return;
+  if (!current.active) return;
+  const k = e.key;
+  if (k === " " || k === "Spacebar" || k === "Enter") { e.preventDefault(); doMark(); }
+  else if (k === "l" || k === "L") { e.preventDefault(); focusLastLabel(); }
+  else if (k === "n" || k === "N") { e.preventDefault(); $("note").focus(); }
+  else if (k === "q" || k === "Q") { e.preventDefault(); $("stopBtn").click(); }
+});
 $("stopBtn").onclick = async () => {
   if (!confirm("Stop the session?")) return;
   $("stopBtn").disabled = true;
-  const d = await api("/api/stop");
+  const d = await api("/api/stop", {});   // POST (a GET would 404 and never stop)
   $("stopBtn").disabled = false;
+  if (d.ok && d.warning) showError(d.warning);  // ended cleanly, but note the issue
   await refresh();
 };
 $("reviewBtn").onclick = async () => {

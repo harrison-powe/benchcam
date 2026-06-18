@@ -5,7 +5,7 @@ from __future__ import annotations
 import csv
 
 from benchcam import session as session_mod
-from benchcam.markers import FIELDNAMES, read_markers
+from benchcam.markers import FIELDNAMES, read_markers, set_marker_label
 
 
 def test_markers_file_has_header(tmp_path):
@@ -69,3 +69,28 @@ def test_marker_with_comma_in_label_is_escaped(tmp_path):
 
     rows = read_markers(session.markers_file)
     assert rows[0]["label"] == "lifted chip, then waited"
+
+
+def test_set_marker_label_updates_only_the_label(tmp_path):
+    root = tmp_path / "sessions"
+    session = session_mod.create_session(root=root)
+    session_mod.start_session(session)
+    session_mod.add_marker(session, "")  # marker 1, no label
+    session_mod.add_marker(session, "old")  # marker 2
+
+    assert set_marker_label(session.markers_file, 2, "new label") is True
+
+    rows = read_markers(session.markers_file)
+    assert rows[0]["label"] == ""  # untouched
+    assert rows[1]["label"] == "new label"
+    # Columns/format preserved: index and numeric elapsed still parse.
+    assert [int(r["marker_index"]) for r in rows] == [1, 2]
+    assert all(float(r["elapsed_seconds"]) >= 0.0 for r in rows)
+    assert rows[1]["source"] == "manual"
+
+
+def test_set_marker_label_unknown_index_returns_false(tmp_path):
+    root = tmp_path / "sessions"
+    session = session_mod.create_session(root=root)
+    session_mod.add_marker(session, "a")
+    assert set_marker_label(session.markers_file, 99, "x") is False

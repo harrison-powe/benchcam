@@ -143,6 +143,65 @@ def test_stop_when_inactive_is_a_clear_noop(root):
     assert "No active session" in result["message"]
 
 
+def test_stop_is_robust_when_recorder_already_stopped(monkeypatch, root):
+    # Simulate OBS already stopped manually: recorder.stop() raises. The session
+    # must still end cleanly (UI leaves RECORDING) and the error is surfaced.
+    class FailingStop(FakeRecorder):
+        def stop(self):
+            self.stop_calls += 1
+            raise RecorderError("output not active")
+
+    rec = FailingStop()
+    _use_recorder(monkeypatch, rec)
+    ctrl = DashboardController(root)
+    started = ctrl.start("obs", "p")
+
+    result = ctrl.stop()
+
+    assert result["stopped"] is True
+    assert "warning" in result and result["warning"]
+    assert rec.stop_calls == 1
+    assert ctrl.status()["active"] is False  # never stuck "RECORDING"
+    reloaded = session_mod.load_session(started["folder"])
+    assert reloaded.status == session_mod.STATUS_ENDED
+    assert reloaded.ended_wall_time is not None
+
+
+# --------------------------------------------------------------------------- #
+# Label-after-mark
+# --------------------------------------------------------------------------- #
+
+def test_label_marker_updates_existing_marker_in_csv(monkeypatch, root):
+    _use_recorder(monkeypatch, FakeRecorder())
+    ctrl = DashboardController(root)
+    ctrl.start("obs", "p")
+    ctrl.mark("")  # marker #1, instant, no label
+    ctrl.mark("")  # marker #2, instant, no label
+
+    res = ctrl.label_marker(2, "chip lifted")
+    assert res["labeled"] == 2
+
+    session = session_mod.get_active_session(root)
+    rows = read_markers(session.markers_file)
+    assert rows[1]["label"] == "chip lifted"
+    assert rows[0]["label"] == ""
+    assert rows[1]["source"] == "manual"  # other fields preserved
+
+    # Editing the label again works.
+    ctrl.label_marker(2, "chip lifted cleanly")
+    rows = read_markers(session.markers_file)
+    assert rows[1]["label"] == "chip lifted cleanly"
+
+
+def test_label_marker_unknown_index_raises(monkeypatch, root):
+    _use_recorder(monkeypatch, FakeRecorder())
+    ctrl = DashboardController(root)
+    ctrl.start("obs", "p")
+    ctrl.mark("")
+    with pytest.raises(DashboardError):
+        ctrl.label_marker(99, "nope")
+
+
 def test_review_calls_edit_on_last_session(monkeypatch, root):
     _use_recorder(monkeypatch, FakeRecorder())
     ctrl = DashboardController(root)
@@ -270,8 +329,14 @@ def test_http_endpoints_drive_a_full_session(monkeypatch, root):
         again = _post(port, "/api/start", {"recorder": "obs"})
         assert again["ok"] is False and "already active" in again["error"]
 
-        marked = _post(port, "/api/mark", {"label": "power on"})
-        assert marked["ok"] is True and marked["marker"]["label"] == "power on"
+        marked = _post(port, "/api/mark", {"label": ""})
+        assert marked["ok"] is True and marked["marker"]["index"] == 1
+
+        # Label the marker after the fact.
+        labeled = _post(port, "/api/label", {"index": 1, "label": "power on"})
+        assert labeled["ok"] is True and labeled["labeled"] == 1
+        status = json.loads(_get(port, "/api/status"))
+        assert status["markers"][0]["label"] == "power on"
 
         stopped = _post(port, "/api/stop", {})
         assert stopped["ok"] is True and stopped["stopped"] is True
