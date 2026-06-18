@@ -123,6 +123,64 @@ def test_collect_cross_drive_uses_copy_then_delete(tmp_path):
     assert not src.exists()
 
 
+def test_collect_delete_fails_then_succeeds_on_retry(tmp_path):
+    # Force the copy+delete path; the first delete attempt fails (writer still
+    # holds the handle), the second succeeds after a retry.
+    src = _make_file(tmp_path / "obs_out" / "racey.mkv")
+    session = tmp_path / "sessions" / "R1"
+    session.mkdir(parents=True)
+    sleeps: list[float] = []
+
+    real_remove = collect_mod.os.remove
+    attempts = {"n": 0}
+
+    def flaky_remove(p):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise OSError("still locked")
+        return real_remove(p)
+
+    with mock.patch.object(
+        collect_mod.os, "replace", side_effect=OSError("cross-device")
+    ), mock.patch.object(collect_mod.os, "remove", side_effect=flaky_remove):
+        dest = collect_recording(
+            src, session, delete_retries=5, delete_delay=0.1, sleep=sleeps.append
+        )
+
+    assert dest == session / "capture.mkv"
+    assert dest.exists()
+    assert attempts["n"] == 2  # retried once
+    assert sleeps == [0.1]  # backed off once between attempts
+    assert not src.exists()  # eventually deleted
+
+
+def test_collect_delete_fails_all_retries_keeps_original_no_crash(tmp_path):
+    src = _make_file(tmp_path / "obs_out" / "stuck.mkv")
+    session = tmp_path / "sessions" / "R2"
+    session.mkdir(parents=True)
+    warnings: list[str] = []
+
+    with mock.patch.object(
+        collect_mod.os, "replace", side_effect=OSError("cross-device")
+    ), mock.patch.object(collect_mod.os, "remove", side_effect=OSError("locked")):
+        dest = collect_recording(
+            src,
+            session,
+            delete_retries=4,
+            delete_delay=0.0,
+            sleep=lambda _i: None,
+            warn=warnings.append,
+        )
+
+    # Copy succeeded -> the video is safely in the session folder (success),
+    # the original is kept (no data loss, no crash), and a warning is logged.
+    assert dest == session / "capture.mkv"
+    assert dest.exists()
+    assert src.exists()
+    assert warnings
+    assert "could not delete the original" in warnings[0].lower()
+
+
 def test_collect_skips_when_already_in_session_folder(tmp_path):
     # Represents an in-folder recorder (like ffmpeg's capture.mp4): no double-move.
     session = tmp_path / "sessions" / "S7"
