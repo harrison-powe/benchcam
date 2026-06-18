@@ -14,6 +14,10 @@ keywords = ["bench", "capture", "markers", "logging", "hardware"]
 dependencies = []
 
 [project.optional-dependencies]
+# OBS recorder backend only. The core is stdlib-only; this extra is imported
+# lazily inside benchcam/recorders/obs.py, so 'pip install benchcam' (without
+# [obs]) never pulls in or requires obsws-python.
+obs = ["obsws-python>=1.7"]
 dev = ["pytest>=7"]
 
 [project.scripts]

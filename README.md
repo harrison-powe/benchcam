@@ -10,21 +10,26 @@ everything is saved as plain local files you can read with any text editor.
 
 - It records a session and logs markers (events with a timestamp + label).
 - It keeps everything in local files only. **No cloud sync.**
-- It can drive a recorder to capture video (ffmpeg works on Windows; OBS planned).
+- It can drive a recorder to capture video (an ffmpeg subprocess on Windows, or
+  OBS Studio over OBS WebSocket).
 - It **does not** control any moving hardware or actuators. BenchCam may later
   receive external marker events, but it stays strictly on the observation side.
 
 v0 ships with a **NullRecorder** (records no video) so you can use and test the
 session + marker workflow immediately, with or without a camera. The
 **FfmpegRecorder** records real video from a webcam on Windows (see
-[Recording video with ffmpeg](#recording-video-with-ffmpeg)); the OBS backend is
-still a stub.
+[Recording video with ffmpeg](#recording-video-with-ffmpeg)), and the
+**ObsRecorder** drives OBS Studio's recording (see
+[Recording video with OBS](#recording-video-with-obs)).
 
 ## Requirements
 
 - Python 3.11 or newer.
 - For video recording: a working `ffmpeg` binary on your `PATH` (only needed if
   you use `--recorder ffmpeg`; the default `null` recorder needs nothing extra).
+- For the OBS recorder: OBS Studio 28+ and the optional `benchcam[obs]` extra
+  (only needed if you use `--recorder obs`). See
+  [Recording video with OBS](#recording-video-with-obs).
 
 ## Install (Windows v0)
 
@@ -174,7 +179,9 @@ The "active" session is tracked by a small pointer file at
 - **NullRecorder** (`null`, default): records no video. Lets you exercise the
   session and marker workflow, and pairs well with capturing video manually in a
   separate app.
-- **ObsRecorder** (`obs`): stub. Planned to drive OBS Studio via obs-websocket.
+- **ObsRecorder** (`obs`): drives OBS Studio's recording over OBS WebSocket v5
+  (optional `benchcam[obs]` extra). See
+  [Recording video with OBS](#recording-video-with-obs).
 - **FfmpegRecorder** (`ffmpeg`): records one video file per session by driving an
   external `ffmpeg` binary. Windows (DirectShow / dshow) is the supported target;
   see [Recording video with ffmpeg](#recording-video-with-ffmpeg).
@@ -223,6 +230,67 @@ only (no audio). An `ffmpeg.log` is written next to the video for troubleshootin
 
 > POSIX note: Linux (v4l2) and macOS (avfoundation) input paths are marked TODO
 > in `build_ffmpeg_command`; Windows is the supported target for v0.
+
+## Recording video with OBS
+
+The `obs` recorder lets BenchCam drive **OBS Studio**'s recording over OBS
+WebSocket v5. OBS stays your live dashboard (preview, framing, focus) while
+BenchCam tells it when to start and stop. Because BenchCam triggers the start,
+marker `elapsed_seconds` lines up with the OBS video timecode automatically.
+
+Unlike the ffmpeg recorder (which writes `capture.mp4` into the session folder),
+**OBS writes the video to its own configured recording folder.** BenchCam can't
+move that, so on stop it records the path OBS reports into the session folder as
+a pointer: `obs_recording.txt` (and a line appended to `notes.md`).
+
+> Single-app camera constraint: with the OBS recorder, **OBS owns the camera**
+> and provides the live preview. Do not also run the ffmpeg recorder against the
+> same C920S — only one app can hold the camera at a time.
+
+### 1. Install OBS and enable the WebSocket server
+
+1. Install OBS Studio 28 or newer (WebSocket v5 is built in — no plugin needed).
+2. In OBS: **Tools → WebSocket Server Settings**.
+3. Check **Enable WebSocket server**. Note the **Server Port** (default `4455`).
+4. Click **Show Connect Info** to see / copy the **Server Password** (auth is on
+   by default).
+
+### 2. Install the optional extra and set the password
+
+The OBS client (`obsws-python`) is an **optional** dependency — the core BenchCam
+install needs nothing third-party. Install the extra and pass the password via an
+environment variable (never commit it):
+
+```powershell
+pip install -e ".[obs]"
+
+# Connection config (constructor arg > env vars > defaults). Set at least the
+# password; host/port default to localhost/4455.
+$env:BENCHCAM_OBS_PASSWORD = "<the password from Show Connect Info>"
+# Optional overrides:
+# $env:BENCHCAM_OBS_HOST = "localhost"
+# $env:BENCHCAM_OBS_PORT = "4455"
+```
+
+If `obsws-python` isn't installed, or OBS isn't running / reachable, the `obs`
+recorder fails with a clear, actionable error instead of silently recording
+nothing.
+
+### 3. Run a session with the OBS recorder
+
+```powershell
+benchcam new --recorder obs --profile bench-a
+benchcam live
+```
+
+Entering `live` (or `benchcam run`) connects to OBS and sends `StartRecord`;
+quitting `live` (or `benchcam end`) sends `StopRecord`, captures the file path OBS
+wrote, and disconnects. If OBS is *already* recording when you start, BenchCam
+refuses (so you don't end up with a second, misaligned recording).
+
+After the session, the OBS video path is in
+`sessions\<id>\obs_recording.txt`, and the marker `elapsed_seconds` values map
+directly onto that recording's timecode.
 
 ### 30-second manual test (Windows 11)
 
@@ -273,7 +341,7 @@ src/benchcam/
     recorders/
         base.py       Recorder interface
         null.py       NullRecorder (default)
-        obs.py        ObsRecorder stub
+        obs.py        ObsRecorder (OBS Studio via OBS WebSocket v5)
         ffmpeg.py     FfmpegRecorder (ffmpeg subprocess; Windows/dshow)
 tests/                unit tests
 ```

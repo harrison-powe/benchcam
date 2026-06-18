@@ -32,10 +32,13 @@ def test_mark_without_session_returns_error(tmp_path, capsys):
     assert "No active session" in err
 
 
-def test_run_with_obs_stub_reports_error(tmp_path, capsys):
+def test_run_with_obs_reports_clear_error_without_extra(tmp_path, capsys):
+    # Without the optional obsws-python extra installed (or without OBS
+    # running), selecting the obs recorder must fail cleanly with an actionable
+    # message rather than silently falling back to null.
     root = str(tmp_path / "sessions")
     assert main(["new", "--sessions-root", root, "--recorder", "obs"]) == 0
     rc = main(["run", "--sessions-root", root])
     assert rc == 1
-    err = capsys.readouterr().err
-    assert "not implemented" in err.lower()
+    err = capsys.readouterr().err.lower()
+    assert "obs" in err
