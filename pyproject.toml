@@ -9,7 +9,7 @@ description = "Local-first bench-side capture and marker logging tool for hardwa
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "BenchCam contributors" }]
+authors = [{ name = "Harrison Powe" }]
 keywords = ["bench", "capture", "markers", "logging", "hardware"]
 dependencies = []
 
