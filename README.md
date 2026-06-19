@@ -2,18 +2,31 @@
 
 catching actuators in the act
 
-BenchCam is a **local-first**, bench-side capture and marker logging tool for
-hardware work. You start a session, log time-stamped markers as you work, and
-everything is saved as plain local files you can read with any text editor.
+BenchCam is a **local-first**, bench-side **capture + event-marking workflow**
+for documenting hardware work. You start a session, log time-stamped markers as
+you work (e.g. "power on", "chip lifted", "fault"), optionally record video with
+an **off-the-shelf webcam**, and end up with a self-contained folder of plain
+files you can read with any text editor — plus an optional auto-edited review
+clip that timelapses the boring parts and slows down around each marker.
+
+> **Status:** v0. Validated on real hardware on a desk (CLI, dashboard, ffmpeg
+> and OBS capture, and the auto-edit all exercised); **not yet used in a real
+> bench session**. Treat it as an early, working tool, not a finished product.
 
 ## What BenchCam is (and is not)
 
-- It records a session and logs markers (events with a timestamp + label).
-- It keeps everything in local files only. **No cloud sync.**
-- It can drive a recorder to capture video (an ffmpeg subprocess on Windows, or
-  OBS Studio over OBS WebSocket).
-- It **does not** control any moving hardware or actuators. BenchCam may later
-  receive external marker events, but it stays strictly on the observation side.
+- It is a **software workflow**: it records a session, logs markers (events with
+  a timestamp + label), and can auto-edit a review clip. Everything is kept in
+  local files only — **no cloud sync, no accounts**.
+- For video it drives **existing, off-the-shelf tools**: an `ffmpeg` subprocess
+  capturing a USB webcam, or OBS Studio over OBS WebSocket. **BenchCam does not
+  build, sell, or include any camera, capture card, or hardware** — you supply a
+  regular webcam and (optionally) OBS or ffmpeg.
+- It is **not** a camera system, not a robotics or motion-control system, and
+  not a PCB/firmware project. There are **no physical controls or custom
+  hardware** — just a CLI and a small local web dashboard. It **does not** drive
+  actuators or any moving hardware; it stays strictly on the observation side
+  (it may later *receive* external marker events, but never commands hardware).
 
 v0 ships with a **NullRecorder** (records no video) so you can use and test the
 session + marker workflow immediately, with or without a camera. The
@@ -24,12 +37,15 @@ session + marker workflow immediately, with or without a camera. The
 
 ## Requirements
 
-- Python 3.11 or newer.
+- **Python 3.11 or newer** (developed and validated on Python 3.13). The core is
+  pure standard library — no third-party packages are required to install or run
+  the session/marker workflow or the dashboard.
 - For video recording: a working `ffmpeg` binary on your `PATH` (only needed if
   you use `--recorder ffmpeg`; the default `null` recorder needs nothing extra).
 - For the OBS recorder: OBS Studio 28+ and the optional `benchcam[obs]` extra
   (only needed if you use `--recorder obs`). See
   [Recording video with OBS](#recording-video-with-obs).
+- A regular **USB webcam** if you want video (BenchCam does not provide one).
 
 ## Install (Windows v0)
 
@@ -577,4 +593,4 @@ tests/                unit tests
 
 ## License
 
-MIT.
+[MIT](LICENSE) © 2026 Harrison Powe.
