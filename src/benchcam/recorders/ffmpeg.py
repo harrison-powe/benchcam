@@ -1,28 +1,41 @@
-"""FfmpegRecorder: capture video from a webcam via an external ``ffmpeg`` binary.
+"""FfmpegRecorder: capture video (and, on Linux, audio) via an external ``ffmpeg``.
 
 This drives ``ffmpeg`` as a subprocess (no Python ffmpeg dependency — runtime
-stays stdlib only). It writes a single video file, ``capture.mp4``, into the
-session folder, started at the same moment the session starts so its timecode
-lines up with marker ``elapsed_seconds`` (which is measured from session start).
+stays stdlib only). It writes a single capture file into the session folder,
+started at the same moment the session starts so its timecode lines up with
+marker ``elapsed_seconds`` (which is measured from session start).
 
-Container choice — ``capture.mp4``:
-    We stop ffmpeg gracefully by sending ``q`` to its stdin, which lets it write
-    the MP4 ``moov`` atom and finalize a playable file. MP4 is the most portable
-    output for playback, so it is the default. The only lossy case is the
-    force-kill fallback (ffmpeg ignored ``q`` past the timeout); a hard-killed
-    MP4 may be truncated. If you expect frequent abrupt termination, MKV would be
-    more resilient, but with graceful shutdown the common path produces a clean
-    MP4 — and the user-facing flow asks to confirm ``capture.mp4`` plays.
+Two capture paths, selected by platform:
 
-Device name:
-    The dshow device name is not knowable in advance, so it is resolved (in
-    priority order) from: an explicit constructor argument, the session's
-    ``camera`` field in ``session.json`` (set via ``benchcam new --camera``), and
-    finally the ``BENCHCAM_CAMERA`` environment variable. List device names with
-    :func:`build_list_devices_command` (or the command documented in the README).
+Windows / DirectShow (``capture.mp4``):
+    Video only, transcoded to H.264. We stop ffmpeg gracefully by sending ``q``
+    to its stdin, which lets it write the MP4 ``moov`` atom and finalize a
+    playable file. MP4 is the most portable output for playback. The only lossy
+    case is the force-kill fallback (ffmpeg ignored ``q`` past the timeout).
 
-Scope: video only, Windows/dshow is the supported target. POSIX (v4l2 /
-avfoundation) is left as clearly-marked TODO stubs in :func:`build_ffmpeg_command`.
+Linux / V4L2 + ALSA (``capture.mkv``) — e.g. a Raspberry Pi 5 capturing from a
+Logitech C920:
+    The C920 emits MJPEG natively, so we request the MJPEG stream and
+    stream-copy it (``-c:v copy``) — the Pi must NOT transcode. Audio (e.g. a
+    Yeti Nano) is read from ALSA and muxed alongside the video. The container is
+    Matroska (``.mkv``) because MJPEG stream-copy is unreliable in ``.mp4``.
+    Harmless ``Dequeued v4l2 buffer contains corrupted data`` warnings are
+    expected at stream startup; ffmpeg logs them to ``ffmpeg.log`` and the
+    recorder never parses stderr, so they are not treated as fatal.
+
+Device strings, capture format, resolution and frame rate are configurable (no
+hardcoded ``/dev/video0`` or Yeti string in the command builder). The video
+device resolves (in priority order) from: an explicit constructor argument, the
+session's ``camera`` field in ``session.json`` (``benchcam new --camera``), the
+``BENCHCAM_CAMERA`` environment variable, and finally a per-platform default
+(``/dev/video0`` on Linux; Windows has no default and requires an explicit
+device name). The ALSA audio device resolves the same way from the constructor /
+``microphone`` field / ``BENCHCAM_MICROPHONE`` / the Yeti default. Resolution,
+frame rate and the V4L2 input format can be overridden with ``BENCHCAM_VIDEO_SIZE``
+(``WxH``), ``BENCHCAM_FRAMERATE`` and ``BENCHCAM_INPUT_FORMAT``.
+
+macOS (avfoundation) is left as a clearly-marked TODO stub.
+
 Capture only — never commands moving hardware.
 """
 
@@ -30,6 +43,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -37,14 +51,30 @@ from pathlib import Path
 
 from .base import Recorder, RecorderError
 
+#: Windows/dshow output (transcoded H.264 — finalizes a portable MP4).
 CAPTURE_FILENAME = "capture.mp4"
+#: Linux/v4l2 output (MJPEG stream-copy is unreliable in .mp4, so use Matroska).
+CAPTURE_FILENAME_MKV = "capture.mkv"
 FFMPEG_LOG_FILENAME = "ffmpeg.log"
 SESSION_FILENAME = "session.json"
+
 ENV_CAMERA = "BENCHCAM_CAMERA"
+ENV_MICROPHONE = "BENCHCAM_MICROPHONE"
+ENV_VIDEO_SIZE = "BENCHCAM_VIDEO_SIZE"
+ENV_FRAMERATE = "BENCHCAM_FRAMERATE"
+ENV_INPUT_FORMAT = "BENCHCAM_INPUT_FORMAT"
 
 DEFAULT_WIDTH = 1920
 DEFAULT_HEIGHT = 1080
 DEFAULT_FPS = 30
+#: The C920 emits this natively; stream-copied as-is on Linux.
+DEFAULT_INPUT_FORMAT = "mjpeg"
+#: Default V4L2 capture device on Linux (override via --camera / BENCHCAM_CAMERA).
+DEFAULT_VIDEO_DEVICE = "/dev/video0"
+#: Default ALSA capture device (Yeti Nano); override via --microphone / env.
+DEFAULT_AUDIO_DEVICE = "plughw:CARD=Nano,DEV=0"
+DEFAULT_AUDIO_RATE = 44100
+DEFAULT_AUDIO_CHANNELS = 2
 
 #: Seconds to wait for ffmpeg to finalize after a graceful stop before force-kill.
 STOP_TIMEOUT_SECONDS = 8.0
@@ -58,9 +88,10 @@ _INSTALL_HINT = (
 
 _NO_CAMERA_HINT = (
     "No camera device configured for the ffmpeg recorder. Provide one with "
-    "'benchcam new --camera \"<device name>\"' (stored in session.json) or set "
-    "the BENCHCAM_CAMERA environment variable. Find the exact name on Windows "
-    "with: ffmpeg -list_devices true -f dshow -i dummy"
+    "'benchcam new --camera \"<device>\"' (stored in session.json) or set the "
+    "BENCHCAM_CAMERA environment variable. On Windows the dshow name is found "
+    "with: ffmpeg -list_devices true -f dshow -i dummy. On Linux it is a V4L2 "
+    "path like /dev/video0 (discover with: v4l2-ctl --list-devices)."
 )
 
 
@@ -82,12 +113,18 @@ def build_ffmpeg_command(
     height: int = DEFAULT_HEIGHT,
     fps: int = DEFAULT_FPS,
     platform: str | None = None,
+    audio_device: str | None = None,
+    input_format: str = DEFAULT_INPUT_FORMAT,
+    audio_rate: int = DEFAULT_AUDIO_RATE,
+    audio_channels: int = DEFAULT_AUDIO_CHANNELS,
 ) -> list[str]:
-    """Build the ffmpeg argument list for a single-camera video capture.
+    """Build the ffmpeg argument list for a single-camera capture.
 
     Pure and side-effect free so it can be unit-tested without spawning ffmpeg.
     ``platform`` defaults to :data:`sys.platform` but can be passed explicitly in
-    tests. Windows (dshow) is the supported target; POSIX paths are TODO stubs.
+    tests. Windows uses DirectShow (video only, transcoded). Linux uses V4L2 with
+    ``-c:v copy`` (no transcode) and, when ``audio_device`` is set, muxes ALSA
+    audio. macOS is a TODO stub.
     """
     if platform is None:
         platform = sys.platform
@@ -107,64 +144,109 @@ def build_ffmpeg_command(
             "-rtbufsize", "100M",
             "-i", f"video={device_name}",
         ]
-    elif platform.startswith("linux"):
-        # TODO (POSIX/Linux, v4l2): real implementation would be roughly
-        #   ["-f", "v4l2", "-framerate", str(fps),
-        #    "-video_size", f"{width}x{height}", "-i", device_name]
-        # where device_name is e.g. "/dev/video0" (discover with
-        # `v4l2-ctl --list-devices`). Windows is the supported target for now.
-        raise RecorderError(_posix_unsupported("Linux", "v4l2"))
-    elif platform == "darwin":
+        encoder_args = [
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-an",  # video only on the Windows/dshow path
+            "-movflags", "+faststart",
+        ]
+        return [ffmpeg, "-hide_banner", "-y", *input_args, *encoder_args, output]
+
+    if platform.startswith("linux"):
+        # V4L2: the C920 emits MJPEG natively, so request that stream and
+        # stream-copy it (-c:v copy). The Pi must not transcode.
+        input_args = [
+            "-f", "v4l2",
+            "-input_format", input_format,
+            "-framerate", str(fps),
+            "-video_size", f"{width}x{height}",
+            "-i", device_name,
+        ]
+        encoder_args = ["-c:v", "copy"]
+        if audio_device:
+            # ALSA audio (e.g. the Yeti Nano), muxed alongside the video.
+            input_args += [
+                "-f", "alsa",
+                "-ac", str(audio_channels),
+                "-ar", str(audio_rate),
+                "-i", audio_device,
+            ]
+            encoder_args += ["-c:a", "aac"]
+        else:
+            encoder_args += ["-an"]
+        # Matroska (.mkv): MJPEG stream-copy is unreliable in .mp4.
+        return [ffmpeg, "-hide_banner", "-y", *input_args, *encoder_args, output]
+
+    if platform == "darwin":
         # TODO (POSIX/macOS, avfoundation): real implementation would be roughly
         #   ["-f", "avfoundation", "-framerate", str(fps),
         #    "-video_size", f"{width}x{height}", "-i", device_name]
         # where device_name is an avfoundation index/name (discover with
         # `ffmpeg -f avfoundation -list_devices true -i ""`).
         raise RecorderError(_posix_unsupported("macOS", "avfoundation"))
-    else:
-        raise RecorderError(
-            f"Unsupported platform {platform!r} for ffmpeg capture; "
-            "Windows (dshow) is the supported target."
-        )
 
-    encoder_args = [
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "23",
-        "-pix_fmt", "yuv420p",
-        "-an",  # video only for v0; no audio mixing
-        "-movflags", "+faststart",
-    ]
-
-    return [ffmpeg, "-hide_banner", "-y", *input_args, *encoder_args, output]
+    raise RecorderError(
+        f"Unsupported platform {platform!r} for ffmpeg capture; "
+        "Windows (dshow) and Linux (v4l2) are the supported targets."
+    )
 
 
 def _posix_unsupported(os_label: str, api: str) -> str:
     return (
         f"FfmpegRecorder on {os_label} is not implemented yet (the {api} input "
-        "path is a TODO). Windows (dshow) is the supported target for v0; use the "
-        "'null' recorder elsewhere."
+        "path is a TODO). Windows (dshow) and Linux (v4l2) are the supported "
+        "targets; use the 'null' recorder elsewhere."
     )
 
 
-def _camera_from_session(storage_path: Path) -> str:
-    """Read the ``camera`` field from ``session.json`` in the session folder."""
+def capture_filename(platform: str | None = None) -> str:
+    """Capture file name for ``platform`` (Matroska on Linux, MP4 elsewhere)."""
+    if platform is None:
+        platform = sys.platform
+    return CAPTURE_FILENAME_MKV if platform.startswith("linux") else CAPTURE_FILENAME
+
+
+def _field_from_session(storage_path: Path, key: str) -> str:
+    """Read a string field (e.g. ``camera``) from ``session.json``."""
     session_file = Path(storage_path) / SESSION_FILENAME
     try:
         data = json.loads(session_file.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return ""
-    value = data.get("camera", "")
+    value = data.get(key, "")
     return value.strip() if isinstance(value, str) else ""
 
 
+def _resolve_video_size() -> tuple[int, int]:
+    """Resolve capture resolution from ``BENCHCAM_VIDEO_SIZE`` (``WxH``) or default."""
+    raw = os.environ.get(ENV_VIDEO_SIZE, "").strip().lower()
+    match = re.fullmatch(r"(\d+)x(\d+)", raw)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    return DEFAULT_WIDTH, DEFAULT_HEIGHT
+
+
+def _resolve_fps() -> int:
+    """Resolve frame rate from ``BENCHCAM_FRAMERATE`` or default."""
+    raw = os.environ.get(ENV_FRAMERATE, "").strip()
+    try:
+        return int(raw) if raw else DEFAULT_FPS
+    except ValueError:
+        return DEFAULT_FPS
+
+
 class FfmpegRecorder(Recorder):
-    """Record one webcam video per session via an ffmpeg subprocess."""
+    """Record one webcam capture per session via an ffmpeg subprocess."""
 
     name = "ffmpeg"
 
-    def __init__(self, camera: str | None = None) -> None:
+    def __init__(self, camera: str | None = None, microphone: str | None = None) -> None:
         self._camera = camera
+        # ``None`` means "fall back to session.json/env/default"; an explicit ""
+        # disables audio (video only) on the Linux path.
+        self._microphone = microphone
         self._process: subprocess.Popen | None = None
         self._log_handle = None
         self._output_path: Path | None = None
@@ -174,13 +256,36 @@ class FfmpegRecorder(Recorder):
         return self._output_path
 
     def _resolve_device(self, storage_path: Path) -> str:
-        """Resolve the dshow device name (constructor > session.json > env)."""
+        """Resolve the video device (constructor > session.json > env > default)."""
         if self._camera:
             return self._camera.strip()
-        from_session = _camera_from_session(storage_path)
+        from_session = _field_from_session(storage_path, "camera")
         if from_session:
             return from_session
-        return os.environ.get(ENV_CAMERA, "").strip()
+        from_env = os.environ.get(ENV_CAMERA, "").strip()
+        if from_env:
+            return from_env
+        if sys.platform.startswith("linux"):
+            return DEFAULT_VIDEO_DEVICE
+        return ""
+
+    def _resolve_audio(self, storage_path: Path) -> str:
+        """Resolve the ALSA audio device on Linux (constructor > session > env > default).
+
+        Returns "" on non-Linux platforms (the Windows/dshow path is video-only)
+        and when audio is explicitly disabled via ``microphone=""``.
+        """
+        if not sys.platform.startswith("linux"):
+            return ""
+        if self._microphone is not None:
+            return self._microphone.strip()
+        from_session = _field_from_session(storage_path, "microphone")
+        if from_session:
+            return from_session
+        from_env = os.environ.get(ENV_MICROPHONE, "").strip()
+        if from_env:
+            return from_env
+        return DEFAULT_AUDIO_DEVICE
 
     def start(self, storage_path: Path) -> None:
         storage_path = Path(storage_path)
@@ -192,13 +297,30 @@ class FfmpegRecorder(Recorder):
         device = self._resolve_device(storage_path)
         if not device:
             raise RecorderError(_NO_CAMERA_HINT)
+        audio_device = self._resolve_audio(storage_path)
+        width, height = _resolve_video_size()
+        fps = _resolve_fps()
+        input_format = (
+            os.environ.get(ENV_INPUT_FORMAT, "").strip() or DEFAULT_INPUT_FORMAT
+        )
 
-        output_path = storage_path / CAPTURE_FILENAME
-        command = build_ffmpeg_command(device, output_path, ffmpeg=ffmpeg_bin)
+        output_path = storage_path / capture_filename()
+        command = build_ffmpeg_command(
+            device,
+            output_path,
+            ffmpeg=ffmpeg_bin,
+            width=width,
+            height=height,
+            fps=fps,
+            audio_device=audio_device,
+            input_format=input_format,
+        )
 
         storage_path.mkdir(parents=True, exist_ok=True)
         # ffmpeg's progress/errors go to stderr; keep a log inside the session
-        # folder (which is gitignored) so failed captures can be diagnosed.
+        # folder (which is gitignored) so failed captures can be diagnosed. On
+        # Linux, expect harmless "Dequeued v4l2 buffer contains corrupted data"
+        # warnings here at startup — they are not fatal.
         self._log_handle = (storage_path / FFMPEG_LOG_FILENAME).open("wb")
         try:
             self._process = subprocess.Popen(

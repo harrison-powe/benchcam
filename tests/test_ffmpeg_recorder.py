@@ -16,13 +16,23 @@ from benchcam.recorders import get_recorder
 from benchcam.recorders.base import RecorderError
 from benchcam.recorders.ffmpeg import (
     CAPTURE_FILENAME,
+    CAPTURE_FILENAME_MKV,
+    DEFAULT_AUDIO_DEVICE,
+    DEFAULT_VIDEO_DEVICE,
     ENV_CAMERA,
+    ENV_FRAMERATE,
+    ENV_INPUT_FORMAT,
+    ENV_MICROPHONE,
+    ENV_VIDEO_SIZE,
     FfmpegRecorder,
     build_ffmpeg_command,
     build_list_devices_command,
+    capture_filename,
 )
 
 DEVICE = "HD Pro Webcam C920S"
+LINUX_DEVICE = "/dev/video0"
+ALSA_DEVICE = "plughw:CARD=Nano,DEV=0"
 
 
 def _pair_at(cmd, flag, value):
@@ -71,14 +81,68 @@ def test_build_command_empty_device_raises(tmp_path):
         build_ffmpeg_command("", tmp_path / CAPTURE_FILENAME, platform="win32")
 
 
-@pytest.mark.parametrize(
-    "platform, api",
-    [("linux", "v4l2"), ("darwin", "avfoundation")],
-)
-def test_build_command_posix_is_todo_stub(tmp_path, platform, api):
+def test_build_command_darwin_is_todo_stub(tmp_path):
     with pytest.raises(RecorderError) as exc:
-        build_ffmpeg_command(DEVICE, tmp_path / CAPTURE_FILENAME, platform=platform)
-    assert api in str(exc.value)
+        build_ffmpeg_command(
+            DEVICE, tmp_path / CAPTURE_FILENAME, platform="darwin"
+        )
+    assert "avfoundation" in str(exc.value)
+
+
+def test_build_command_linux_v4l2_with_audio(tmp_path):
+    output = tmp_path / CAPTURE_FILENAME_MKV
+    cmd = build_ffmpeg_command(
+        LINUX_DEVICE,
+        output,
+        ffmpeg="ffmpeg",
+        platform="linux",
+        audio_device=ALSA_DEVICE,
+    )
+
+    assert _pair_at(cmd, "-f", "v4l2")
+    assert _pair_at(cmd, "-input_format", "mjpeg")
+    assert _pair_at(cmd, "-video_size", "1920x1080")
+    assert _pair_at(cmd, "-framerate", "30")
+    assert _pair_at(cmd, "-i", LINUX_DEVICE)
+    # MJPEG must be stream-copied (the Pi must not transcode).
+    assert _pair_at(cmd, "-c:v", "copy")
+    assert "libx264" not in cmd
+    # Audio: ALSA input, muxed into the capture file.
+    assert _pair_at(cmd, "-f", "alsa")
+    assert _pair_at(cmd, "-i", ALSA_DEVICE)
+    assert "-an" not in cmd
+    assert cmd[-1] == str(output)
+    assert cmd[-1].endswith(".mkv")
+
+
+def test_build_command_linux_without_audio_is_video_only(tmp_path):
+    cmd = build_ffmpeg_command(
+        LINUX_DEVICE, tmp_path / CAPTURE_FILENAME_MKV, platform="linux"
+    )
+    assert _pair_at(cmd, "-c:v", "copy")
+    assert "-an" in cmd
+    assert "alsa" not in cmd
+
+
+def test_build_command_linux_respects_format_resolution_fps(tmp_path):
+    cmd = build_ffmpeg_command(
+        LINUX_DEVICE,
+        tmp_path / CAPTURE_FILENAME_MKV,
+        platform="linux",
+        width=1280,
+        height=720,
+        fps=24,
+        input_format="yuyv422",
+    )
+    assert _pair_at(cmd, "-video_size", "1280x720")
+    assert _pair_at(cmd, "-framerate", "24")
+    assert _pair_at(cmd, "-input_format", "yuyv422")
+
+
+def test_capture_filename_is_platform_aware():
+    assert capture_filename("linux") == CAPTURE_FILENAME_MKV
+    assert capture_filename("win32") == CAPTURE_FILENAME
+    assert capture_filename("darwin") == CAPTURE_FILENAME
 
 
 def test_list_devices_command():
@@ -104,7 +168,10 @@ def test_start_raises_clearly_when_ffmpeg_missing(tmp_path, monkeypatch):
 
 
 def test_start_raises_when_no_camera_configured(tmp_path, monkeypatch):
+    # Windows/dshow has no default device, so a blank camera must raise. (Linux
+    # defaults to /dev/video0, covered separately.)
     monkeypatch.delenv(ENV_CAMERA, raising=False)
+    monkeypatch.setattr("benchcam.recorders.ffmpeg.sys.platform", "win32")
     root = tmp_path / "sessions"
     session = session_mod.create_session(root=root)  # camera defaults to ""
     with mock.patch("benchcam.recorders.ffmpeg.shutil.which", return_value="/x/ffmpeg"):
@@ -169,6 +236,73 @@ def test_env_camera_used_when_session_blank(tmp_path, monkeypatch):
         FfmpegRecorder().start(session.folder)
 
     assert "video=env-cam" in popen.call_args.args[0]
+
+
+def test_start_linux_defaults_to_video0_yeti_and_mkv(tmp_path, monkeypatch):
+    monkeypatch.delenv(ENV_CAMERA, raising=False)
+    monkeypatch.delenv(ENV_MICROPHONE, raising=False)
+    monkeypatch.delenv(ENV_VIDEO_SIZE, raising=False)
+    monkeypatch.delenv(ENV_FRAMERATE, raising=False)
+    monkeypatch.delenv(ENV_INPUT_FORMAT, raising=False)
+    monkeypatch.setattr("benchcam.recorders.ffmpeg.sys.platform", "linux")
+    root = tmp_path / "sessions"
+    session = session_mod.create_session(root=root)  # blank camera/microphone
+
+    with mock.patch(
+        "benchcam.recorders.ffmpeg.shutil.which", return_value="/usr/bin/ffmpeg"
+    ), mock.patch(
+        "benchcam.recorders.ffmpeg.subprocess.Popen", return_value=mock.MagicMock()
+    ) as popen:
+        rec = FfmpegRecorder()
+        rec.start(session.folder)
+
+    command = popen.call_args.args[0]
+    assert "v4l2" in command
+    assert DEFAULT_VIDEO_DEVICE in command
+    assert DEFAULT_AUDIO_DEVICE in command
+    assert "copy" in command  # -c:v copy (no transcode)
+    assert command[-1].endswith(CAPTURE_FILENAME_MKV)
+    assert rec.output_path == session.folder / CAPTURE_FILENAME_MKV
+
+
+def test_start_linux_blank_microphone_disables_audio(tmp_path, monkeypatch):
+    monkeypatch.delenv(ENV_MICROPHONE, raising=False)
+    monkeypatch.setattr("benchcam.recorders.ffmpeg.sys.platform", "linux")
+    root = tmp_path / "sessions"
+    session = session_mod.create_session(root=root, camera="/dev/video2")
+
+    with mock.patch(
+        "benchcam.recorders.ffmpeg.shutil.which", return_value="/usr/bin/ffmpeg"
+    ), mock.patch(
+        "benchcam.recorders.ffmpeg.subprocess.Popen", return_value=mock.MagicMock()
+    ) as popen:
+        FfmpegRecorder(microphone="").start(session.folder)
+
+    command = popen.call_args.args[0]
+    assert "/dev/video2" in command
+    assert "alsa" not in command
+    assert "-an" in command
+
+
+def test_start_linux_respects_env_overrides(tmp_path, monkeypatch):
+    monkeypatch.setenv(ENV_VIDEO_SIZE, "1280x720")
+    monkeypatch.setenv(ENV_FRAMERATE, "24")
+    monkeypatch.setenv(ENV_INPUT_FORMAT, "yuyv422")
+    monkeypatch.setattr("benchcam.recorders.ffmpeg.sys.platform", "linux")
+    root = tmp_path / "sessions"
+    session = session_mod.create_session(root=root)
+
+    with mock.patch(
+        "benchcam.recorders.ffmpeg.shutil.which", return_value="/usr/bin/ffmpeg"
+    ), mock.patch(
+        "benchcam.recorders.ffmpeg.subprocess.Popen", return_value=mock.MagicMock()
+    ) as popen:
+        FfmpegRecorder().start(session.folder)
+
+    command = popen.call_args.args[0]
+    assert _pair_at(command, "-video_size", "1280x720")
+    assert _pair_at(command, "-framerate", "24")
+    assert _pair_at(command, "-input_format", "yuyv422")
 
 
 # --------------------------------------------------------------------------- #
