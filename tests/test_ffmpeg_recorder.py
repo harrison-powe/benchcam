@@ -345,6 +345,44 @@ def test_stop_timeout_triggers_kill_fallback_after_graceful():
     assert kinds.index("write") < kinds.index("kill")  # graceful before kill
 
 
+def test_stop_linux_terminates_then_kills_when_graceful_times_out():
+    # Linux/v4l2 path: SIGTERM is the primary stop, and if it doesn't exit in
+    # time the SIGKILL fallback must ALWAYS run (and stop() must not raise).
+    events = []
+    proc = mock.MagicMock()
+    proc.poll.return_value = None  # still running
+    proc.terminate.side_effect = lambda: events.append("terminate")
+    proc.kill.side_effect = lambda: events.append("kill")
+    # First wait (after SIGTERM) times out; the post-kill wait reaps cleanly.
+    proc.wait.side_effect = [subprocess.TimeoutExpired(cmd="ffmpeg", timeout=8), 0]
+
+    rec = FfmpegRecorder()
+    rec._use_signal_stop = True  # as set by start() on Linux
+    rec._process = proc
+    rec.stop()  # must not raise
+
+    assert events == ["terminate", "kill"]
+    # The Linux path must not rely on 'q'-to-stdin.
+    proc.stdin.write.assert_not_called()
+
+
+def test_stop_linux_does_not_kill_when_sigterm_exits_cleanly():
+    events = []
+    proc = mock.MagicMock()
+    proc.poll.return_value = None
+    proc.terminate.side_effect = lambda: events.append("terminate")
+    proc.kill.side_effect = lambda: events.append("kill")
+    proc.wait.return_value = 0  # SIGTERM stops ffmpeg promptly
+
+    rec = FfmpegRecorder()
+    rec._use_signal_stop = True
+    rec._process = proc
+    rec.stop()
+
+    assert events == ["terminate"]  # no SIGKILL needed
+    proc.stdin.write.assert_not_called()
+
+
 def test_stop_is_safe_when_never_started():
     rec = FfmpegRecorder()
     rec.stop()  # no process; must not raise

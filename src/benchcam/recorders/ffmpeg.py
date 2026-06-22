@@ -250,6 +250,10 @@ class FfmpegRecorder(Recorder):
         self._process: subprocess.Popen | None = None
         self._log_handle = None
         self._output_path: Path | None = None
+        # Linux/v4l2 capture does not stop reliably via 'q' on stdin, so stop()
+        # uses SIGTERM->SIGKILL there. Set in start(); defaults to the Windows
+        # 'q'-to-stdin path so a directly-driven recorder keeps that behavior.
+        self._use_signal_stop = False
 
     @property
     def output_path(self) -> Path | None:
@@ -332,9 +336,19 @@ class FfmpegRecorder(Recorder):
         except OSError as exc:  # pragma: no cover - defensive
             self._close_log()
             raise RecorderError(f"Failed to launch ffmpeg: {exc}") from exc
+        # The Linux/v4l2 path needs SIGTERM->SIGKILL on stop (q-to-stdin is
+        # unreliable for V4L2); the Windows/dshow path keeps the 'q' finalize.
+        self._use_signal_stop = sys.platform.startswith("linux")
         self._output_path = output_path
 
     def stop(self) -> None:
+        """Stop ffmpeg, guaranteeing the process is dead before returning.
+
+        A runaway ffmpeg on a headless Pi fills the SD card, so the kill
+        fallback ALWAYS runs if the primary stop does not exit in time, and the
+        final wait blocks until the process is reaped — stop() never returns with
+        ffmpeg still capturing.
+        """
         proc = self._process
         if proc is None:
             self._close_log()
@@ -342,22 +356,40 @@ class FfmpegRecorder(Recorder):
 
         try:
             if proc.poll() is None:
-                self._graceful_stop(proc)
-                try:
-                    proc.wait(timeout=STOP_TIMEOUT_SECONDS)
-                except subprocess.TimeoutExpired:
-                    # ffmpeg did not finalize in time; force-kill as a fallback.
+                if self._use_signal_stop:
+                    # Linux/v4l2: 'q' on stdin does not reliably stop a V4L2
+                    # capture, so SIGTERM is the primary stop.
+                    proc.terminate()
+                else:
+                    # Windows/dshow: 'q' lets ffmpeg write the mp4 moov atom and
+                    # finalize a playable file.
+                    self._graceful_stop(proc)
+
+                if not self._wait_for_exit(proc, STOP_TIMEOUT_SECONDS):
+                    # Primary stop didn't exit in time; SIGKILL, then block until
+                    # the kill is reaped so we never leave ffmpeg writing.
                     proc.kill()
-                    try:
-                        proc.wait(timeout=STOP_TIMEOUT_SECONDS)
-                    except subprocess.TimeoutExpired:  # pragma: no cover
-                        pass
+                    self._wait_for_exit(proc, None)
         finally:
             self._process = None
             self._close_log()
 
+    @staticmethod
+    def _wait_for_exit(proc: subprocess.Popen, timeout: float | None) -> bool:
+        """Wait for ``proc`` to exit; return True if it did, False on timeout.
+
+        Swallows :class:`subprocess.TimeoutExpired` so callers can decide on the
+        fallback — a propagating timeout must never skip the SIGKILL fallback.
+        ``timeout=None`` blocks until the process is reaped.
+        """
+        try:
+            proc.wait(timeout=timeout)
+            return True
+        except subprocess.TimeoutExpired:
+            return False
+
     def _graceful_stop(self, proc: subprocess.Popen) -> None:
-        """Ask ffmpeg to finalize the file by sending 'q' to its stdin."""
+        """Ask ffmpeg to finalize the file by sending 'q' to its stdin (dshow)."""
         stdin = proc.stdin
         if stdin is None:
             # No stdin to talk to; fall back to a polite terminate (SIGTERM /
