@@ -222,20 +222,23 @@ The "active" session is tracked by a small pointer file at
 - **ObsRecorder** (`obs`): drives OBS Studio's recording over OBS WebSocket v5
   (optional `benchcam[obs]` extra). See
   [Recording video with OBS](#recording-video-with-obs).
-- **FfmpegRecorder** (`ffmpeg`): records one video file per session by driving an
-  external `ffmpeg` binary. Windows (DirectShow / dshow) is the supported target;
-  see [Recording video with ffmpeg](#recording-video-with-ffmpeg).
+- **FfmpegRecorder** (`ffmpeg`): records one capture file per session by driving
+  an external `ffmpeg` binary. Two paths are supported and selected by platform:
+  Windows (DirectShow / dshow, video-only `capture.mp4`) and Linux (V4L2 + ALSA,
+  `capture.mkv` with audio — e.g. a Raspberry Pi capturing from a C920). See
+  [Recording video with ffmpeg](#recording-video-with-ffmpeg).
 
 See `src/benchcam/recorders/` for the recorder code.
 
 ## Recording video with ffmpeg
 
-The `ffmpeg` recorder captures one video file, **`capture.mp4`**, into the
-session folder. It starts when the session starts, so the video timecode lines
-up with each marker's `elapsed_seconds`. ffmpeg is run as an external binary —
-BenchCam adds no Python ffmpeg dependency, so you must have `ffmpeg` on your
-`PATH` (`winget install Gyan.FFmpeg`, or download from
-[ffmpeg.org](https://ffmpeg.org/download.html) and add it to `PATH`).
+The `ffmpeg` recorder captures one file into the session folder (**`capture.mp4`**
+on Windows, **`capture.mkv`** on Linux). It starts when the session starts, so the
+video timecode lines up with each marker's `elapsed_seconds`. ffmpeg is run as an
+external binary — BenchCam adds no Python ffmpeg dependency, so you must have
+`ffmpeg` on your `PATH` (`winget install Gyan.FFmpeg`, or download from
+[ffmpeg.org](https://ffmpeg.org/download.html) and add it to `PATH`; on Debian/RPi
+OS `sudo apt install ffmpeg`).
 
 ### 1. Find your camera's device name
 
@@ -268,8 +271,48 @@ fails with a clear message instead of silently recording nothing.
 Defaults are tuned for the C920S: 1080p30 over MJPEG, H.264 (`libx264`), video
 only (no audio). An `ffmpeg.log` is written next to the video for troubleshooting.
 
-> POSIX note: Linux (v4l2) and macOS (avfoundation) input paths are marked TODO
-> in `build_ffmpeg_command`; Windows is the supported target for v0.
+### 3. Recording headless on a Raspberry Pi (Linux / V4L2 + ALSA)
+
+On Linux the recorder captures over **V4L2** and writes **`capture.mkv`**. The
+C920 emits MJPEG natively, so the stream is **copied** (`-c:v copy`) — the Pi
+never transcodes — and Matroska is used because MJPEG stream-copy is unreliable
+in `.mp4`. ALSA audio (e.g. a Yeti Nano) is muxed into the same file.
+
+The defaults match a confirmed C920 + Yeti Nano setup, so a plain session works
+out of the box:
+
+```bash
+benchcam new --recorder ffmpeg --profile bench-pi
+benchcam run        # captures /dev/video0 (mjpeg 1920x1080@30) + Yeti via ALSA
+# ... benchcam mark "label" ...
+benchcam end        # sends 'q' so capture.mkv is finalized
+```
+
+Everything is configurable (nothing is hardcoded in the command builder):
+
+| Setting        | Default                   | Override |
+| -------------- | ------------------------- | -------- |
+| Video device   | `/dev/video0`             | `--camera` (stored in session.json) or `BENCHCAM_CAMERA` |
+| Audio device   | `plughw:CARD=Nano,DEV=0`  | `--microphone` (stored in session.json) or `BENCHCAM_MICROPHONE` (set empty to disable audio) |
+| Input format   | `mjpeg`                   | `BENCHCAM_INPUT_FORMAT` |
+| Resolution     | `1920x1080`               | `BENCHCAM_VIDEO_SIZE` (`WxH`) |
+| Frame rate     | `30`                      | `BENCHCAM_FRAMERATE` |
+
+Discover V4L2 devices with `v4l2-ctl --list-devices` and ALSA capture devices
+with `arecord -L`. The underlying command is equivalent to the manually
+validated:
+
+```bash
+ffmpeg -f v4l2 -input_format mjpeg -framerate 30 -video_size 1920x1080 \
+  -i /dev/video0 -f alsa -ac 2 -ar 44100 -i plughw:CARD=Nano,DEV=0 \
+  -c:v copy -c:a aac capture.mkv
+```
+
+> Harmless `Dequeued v4l2 buffer contains corrupted data` warnings at stream
+> startup are expected; they are logged to `ffmpeg.log` and are not fatal.
+
+> macOS note: the avfoundation input path is still a TODO stub in
+> `build_ffmpeg_command`.
 
 ## Recording video with OBS
 
