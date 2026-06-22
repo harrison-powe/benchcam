@@ -39,7 +39,7 @@ class FakeRecorder:
         if self.fail_start:
             raise RecorderError("OBS is not running")
 
-    def stop(self):
+    def stop(self, storage_path=None):
         self.stop_calls += 1
 
 
@@ -148,7 +148,7 @@ def test_stop_is_robust_when_recorder_already_stopped(monkeypatch, root):
     # Simulate OBS already stopped manually: recorder.stop() raises. The session
     # must still end cleanly (UI leaves RECORDING) and the error is surfaced.
     class FailingStop(FakeRecorder):
-        def stop(self):
+        def stop(self, storage_path=None):
             self.stop_calls += 1
             raise RecorderError("output not active")
 

@@ -157,7 +157,7 @@ class ObsRecorder(Recorder):
 
         self._client = client
 
-    def stop(self) -> None:
+    def stop(self, storage_path: Path | None = None) -> None:
         client = self._client
         if client is None:
             return

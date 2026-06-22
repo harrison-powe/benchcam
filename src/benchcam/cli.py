@@ -215,7 +215,10 @@ def cmd_mark(args: argparse.Namespace) -> int:
 def cmd_end(args: argparse.Namespace) -> int:
     session = session_mod.get_active_session(Path(args.sessions_root))
     recorder = get_recorder(session.recorder)
-    recorder.stop()
+    # cmd_run started ffmpeg in a *different* process, so this fresh recorder has
+    # no in-memory handle; pass the session folder so it can stop the capture via
+    # the persisted ffmpeg.pid instead of leaving it orphaned.
+    recorder.stop(session.folder)
     session_mod.end_session(session)
     print(f"Ended session {session.session_id}.")
     print(f"  markers: {session.markers_file}")
