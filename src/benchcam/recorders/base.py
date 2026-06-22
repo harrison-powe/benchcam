@@ -31,8 +31,15 @@ class Recorder:
         """
         raise NotImplementedError
 
-    def stop(self) -> None:
-        """Stop capturing media. Safe to call even if never started."""
+    def stop(self, storage_path: Path | None = None) -> None:
+        """Stop capturing media. Safe to call even if never started.
+
+        ``storage_path`` (the session folder) is optional and lets a recorder
+        stop a capture it did not start in this process — e.g. the ffmpeg
+        recorder persists its subprocess PID into the session folder so that
+        ``benchcam end`` (a separate process from ``benchcam run``) can find and
+        terminate it. In-process callers can omit it.
+        """
         raise NotImplementedError
 
     def __repr__(self) -> str:  # pragma: no cover - trivial

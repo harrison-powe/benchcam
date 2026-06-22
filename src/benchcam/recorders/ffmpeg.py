@@ -45,8 +45,10 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from .base import Recorder, RecorderError
@@ -57,6 +59,14 @@ CAPTURE_FILENAME = "capture.mp4"
 CAPTURE_FILENAME_MKV = "capture.mkv"
 FFMPEG_LOG_FILENAME = "ffmpeg.log"
 SESSION_FILENAME = "session.json"
+#: Records the running ffmpeg PID so a later, separate process (``benchcam end``)
+#: can stop the capture that ``benchcam run`` started — they are different
+#: processes, so the in-memory Popen handle is not shared between them.
+PIDFILE_FILENAME = "ffmpeg.pid"
+
+#: SIGKILL is POSIX-only; on Windows os.kill treats any non-CTRL signal as a
+#: hard TerminateProcess, so SIGTERM is a safe stand-in there.
+_SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 ENV_CAMERA = "BENCHCAM_CAMERA"
 ENV_MICROPHONE = "BENCHCAM_MICROPHONE"
@@ -250,6 +260,11 @@ class FfmpegRecorder(Recorder):
         self._process: subprocess.Popen | None = None
         self._log_handle = None
         self._output_path: Path | None = None
+        self._storage_path: Path | None = None
+        # Linux/v4l2 capture does not stop reliably via 'q' on stdin, so stop()
+        # uses SIGTERM->SIGKILL there. Set in start(); defaults to the Windows
+        # 'q'-to-stdin path so a directly-driven recorder keeps that behavior.
+        self._use_signal_stop = False
 
     @property
     def output_path(self) -> Path | None:
@@ -332,32 +347,171 @@ class FfmpegRecorder(Recorder):
         except OSError as exc:  # pragma: no cover - defensive
             self._close_log()
             raise RecorderError(f"Failed to launch ffmpeg: {exc}") from exc
+        # The Linux/v4l2 path needs SIGTERM->SIGKILL on stop (q-to-stdin is
+        # unreliable for V4L2); the Windows/dshow path keeps the 'q' finalize.
+        self._use_signal_stop = sys.platform.startswith("linux")
         self._output_path = output_path
+        self._storage_path = storage_path
+        # Persist the PID so a *different* process (benchcam end vs. benchcam run)
+        # can find and stop this ffmpeg — otherwise it runs orphaned and fills
+        # the disk. Best-effort: a failed write must not abort the capture.
+        try:
+            (storage_path / PIDFILE_FILENAME).write_text(
+                f"{self._process.pid}\n", encoding="utf-8"
+            )
+        except OSError:  # pragma: no cover - defensive
+            pass
 
-    def stop(self) -> None:
+    def stop(self, storage_path: Path | None = None) -> None:
+        """Stop ffmpeg, guaranteeing the process is dead before returning.
+
+        Two cases:
+
+        * In-process (the dashboard / ``benchcam live``): we still hold the
+          ``Popen`` handle, so stop it directly.
+        * Cross-process (``benchcam end`` after ``benchcam run``): the handle is
+          ``None`` because a different process started ffmpeg. We read the PID
+          from ``ffmpeg.pid`` in the session folder and stop *that* PID instead,
+          so the capture can never run orphaned and fill the disk.
+
+        A runaway ffmpeg on a headless Pi fills the SD card, so the SIGKILL
+        fallback ALWAYS runs if the primary stop does not exit in time, and we
+        block until the process is confirmed gone before returning.
+        """
+        folder = Path(storage_path) if storage_path is not None else self._storage_path
         proc = self._process
-        if proc is None:
-            self._close_log()
+
+        if proc is not None:
+            # In-process: use the live handle.
+            try:
+                self._stop_handle(proc)
+            finally:
+                self._process = None
+                self._close_log()
+            self._remove_pidfile(folder)
             return
 
+        # Cross-process: no handle, so fall back to the persisted PID.
+        self._close_log()
+        if folder is not None:
+            self._stop_via_pidfile(folder)
+
+    def _stop_handle(self, proc: subprocess.Popen) -> None:
+        """Stop ffmpeg via the in-memory Popen handle (SIGTERM/q -> SIGKILL)."""
+        if proc.poll() is not None:
+            return
+        if self._use_signal_stop:
+            # Linux/v4l2: 'q' on stdin does not reliably stop a V4L2 capture,
+            # so SIGTERM is the primary stop.
+            proc.terminate()
+        else:
+            # Windows/dshow: 'q' lets ffmpeg write the mp4 moov atom and
+            # finalize a playable file.
+            self._graceful_stop(proc)
+        if not self._wait_for_exit(proc, STOP_TIMEOUT_SECONDS):
+            # Primary stop didn't exit in time; SIGKILL, then block until the
+            # kill is reaped so we never leave ffmpeg writing.
+            proc.kill()
+            self._wait_for_exit(proc, None)
+
+    def _stop_via_pidfile(self, folder: Path) -> None:
+        """Read ``ffmpeg.pid`` and stop that PID; tolerate a stale/missing file.
+
+        Mirrors the in-memory SIGTERM->SIGKILL logic but on a bare PID, since the
+        process that holds the Popen handle has already exited.
+        """
+        pidfile = Path(folder) / PIDFILE_FILENAME
+        pid = self._read_pid(pidfile)
+        if pid is not None:
+            self._signal_pid_until_dead(pid)
+        # Clean up the pidfile whether we signaled, found it stale, or it was
+        # garbage — a leftover pidfile must never mislead a future stop.
+        self._remove_pidfile(folder)
+
+    @staticmethod
+    def _read_pid(pidfile: Path) -> int | None:
+        """Parse a positive PID from ``pidfile``, or None if missing/garbage."""
         try:
-            if proc.poll() is None:
-                self._graceful_stop(proc)
-                try:
-                    proc.wait(timeout=STOP_TIMEOUT_SECONDS)
-                except subprocess.TimeoutExpired:
-                    # ffmpeg did not finalize in time; force-kill as a fallback.
-                    proc.kill()
-                    try:
-                        proc.wait(timeout=STOP_TIMEOUT_SECONDS)
-                    except subprocess.TimeoutExpired:  # pragma: no cover
-                        pass
-        finally:
-            self._process = None
-            self._close_log()
+            text = pidfile.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        try:
+            pid = int(text)
+        except ValueError:
+            return None
+        return pid if pid > 0 else None
+
+    def _signal_pid_until_dead(self, pid: int) -> None:
+        """SIGTERM, wait up to the timeout, then SIGKILL; block until gone.
+
+        PID-reuse is an accepted risk on this single-user bench appliance, so we
+        signal the PID directly without extra identity checks.
+        """
+        if not self._pid_alive(pid):
+            return
+        self._send_signal(pid, signal.SIGTERM)
+        if self._wait_pid_gone(pid, STOP_TIMEOUT_SECONDS):
+            return
+        # Did not exit in time — force kill and block until it is gone.
+        self._send_signal(pid, _SIGKILL)
+        self._wait_pid_gone(pid, STOP_TIMEOUT_SECONDS)
+
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        """True if ``pid`` exists. Signal 0 only probes; it does not kill."""
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:  # exists but owned by another user
+            return True
+        except OSError:
+            return False
+        return True
+
+    @staticmethod
+    def _send_signal(pid: int, sig: int) -> None:
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            pass  # already gone (or cannot signal) — liveness checks decide
+
+    @classmethod
+    def _wait_pid_gone(cls, pid: int, timeout: float) -> bool:
+        """Poll until ``pid`` is gone or ``timeout`` elapses; True if gone."""
+        deadline = time.monotonic() + timeout
+        while True:
+            if not cls._pid_alive(pid):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.1)
+
+    @staticmethod
+    def _remove_pidfile(folder: Path | None) -> None:
+        if folder is None:
+            return
+        try:
+            (Path(folder) / PIDFILE_FILENAME).unlink()
+        except OSError:
+            pass
+
+    @staticmethod
+    def _wait_for_exit(proc: subprocess.Popen, timeout: float | None) -> bool:
+        """Wait for ``proc`` to exit; return True if it did, False on timeout.
+
+        Swallows :class:`subprocess.TimeoutExpired` so callers can decide on the
+        fallback — a propagating timeout must never skip the SIGKILL fallback.
+        ``timeout=None`` blocks until the process is reaped.
+        """
+        try:
+            proc.wait(timeout=timeout)
+            return True
+        except subprocess.TimeoutExpired:
+            return False
 
     def _graceful_stop(self, proc: subprocess.Popen) -> None:
-        """Ask ffmpeg to finalize the file by sending 'q' to its stdin."""
+        """Ask ffmpeg to finalize the file by sending 'q' to its stdin (dshow)."""
         stdin = proc.stdin
         if stdin is None:
             # No stdin to talk to; fall back to a polite terminate (SIGTERM /

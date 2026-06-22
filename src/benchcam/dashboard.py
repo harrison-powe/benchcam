@@ -203,7 +203,10 @@ class DashboardController:
         warning = None
         try:
             if recorder is not None:
-                recorder.stop()
+                # The dashboard is one long-lived process, so the recorder still
+                # holds its handle and stops in-process; pass the folder anyway so
+                # the ffmpeg pidfile is cleaned up.
+                recorder.stop(session.folder)
         except Exception as exc:  # noqa: BLE001 - never block the end transition
             warning = f"Recorder stop reported: {exc}"
 

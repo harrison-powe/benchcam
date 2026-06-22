@@ -33,5 +33,5 @@ class NullRecorder(Recorder):
         self._storage_path = Path(storage_path)
         self._running = True
 
-    def stop(self) -> None:
+    def stop(self, storage_path: Path | None = None) -> None:
         self._running = False

@@ -6,6 +6,7 @@ No real ffmpeg and no real camera are used: ``subprocess.Popen`` and
 
 from __future__ import annotations
 
+import signal
 import subprocess
 from unittest import mock
 
@@ -24,6 +25,7 @@ from benchcam.recorders.ffmpeg import (
     ENV_INPUT_FORMAT,
     ENV_MICROPHONE,
     ENV_VIDEO_SIZE,
+    PIDFILE_FILENAME,
     FfmpegRecorder,
     build_ffmpeg_command,
     build_list_devices_command,
@@ -33,6 +35,8 @@ from benchcam.recorders.ffmpeg import (
 DEVICE = "HD Pro Webcam C920S"
 LINUX_DEVICE = "/dev/video0"
 ALSA_DEVICE = "plughw:CARD=Nano,DEV=0"
+# SIGKILL on POSIX; SIGTERM stand-in where SIGKILL is unavailable (Windows).
+EXPECTED_SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 
 def _pair_at(cmd, flag, value):
@@ -305,6 +309,24 @@ def test_start_linux_respects_env_overrides(tmp_path, monkeypatch):
     assert _pair_at(command, "-input_format", "yuyv422")
 
 
+def test_start_writes_pidfile_into_session_folder(tmp_path, monkeypatch):
+    monkeypatch.setattr("benchcam.recorders.ffmpeg.sys.platform", "linux")
+    root = tmp_path / "sessions"
+    session = session_mod.create_session(root=root)
+
+    fake_proc = mock.MagicMock()
+    fake_proc.pid = 4321
+    with mock.patch(
+        "benchcam.recorders.ffmpeg.shutil.which", return_value="/usr/bin/ffmpeg"
+    ), mock.patch(
+        "benchcam.recorders.ffmpeg.subprocess.Popen", return_value=fake_proc
+    ):
+        FfmpegRecorder().start(session.folder)
+
+    # A later, separate process must be able to find the PID to stop ffmpeg.
+    assert (session.folder / PIDFILE_FILENAME).read_text().strip() == "4321"
+
+
 # --------------------------------------------------------------------------- #
 # stop()
 # --------------------------------------------------------------------------- #
@@ -343,6 +365,110 @@ def test_stop_timeout_triggers_kill_fallback_after_graceful():
     kinds = [kind for kind, _ in events]
     assert "write" in kinds and "kill" in kinds
     assert kinds.index("write") < kinds.index("kill")  # graceful before kill
+
+
+def test_stop_linux_terminates_then_kills_when_graceful_times_out():
+    # Linux/v4l2 path: SIGTERM is the primary stop, and if it doesn't exit in
+    # time the SIGKILL fallback must ALWAYS run (and stop() must not raise).
+    events = []
+    proc = mock.MagicMock()
+    proc.poll.return_value = None  # still running
+    proc.terminate.side_effect = lambda: events.append("terminate")
+    proc.kill.side_effect = lambda: events.append("kill")
+    # First wait (after SIGTERM) times out; the post-kill wait reaps cleanly.
+    proc.wait.side_effect = [subprocess.TimeoutExpired(cmd="ffmpeg", timeout=8), 0]
+
+    rec = FfmpegRecorder()
+    rec._use_signal_stop = True  # as set by start() on Linux
+    rec._process = proc
+    rec.stop()  # must not raise
+
+    assert events == ["terminate", "kill"]
+    # The Linux path must not rely on 'q'-to-stdin.
+    proc.stdin.write.assert_not_called()
+
+
+def test_stop_linux_does_not_kill_when_sigterm_exits_cleanly():
+    events = []
+    proc = mock.MagicMock()
+    proc.poll.return_value = None
+    proc.terminate.side_effect = lambda: events.append("terminate")
+    proc.kill.side_effect = lambda: events.append("kill")
+    proc.wait.return_value = 0  # SIGTERM stops ffmpeg promptly
+
+    rec = FfmpegRecorder()
+    rec._use_signal_stop = True
+    rec._process = proc
+    rec.stop()
+
+    assert events == ["terminate"]  # no SIGKILL needed
+    proc.stdin.write.assert_not_called()
+
+
+def test_stop_via_pidfile_signals_pid_from_a_different_instance(tmp_path, monkeypatch):
+    # The real CLI flow: `benchcam run` starts ffmpeg in one process; a DIFFERENT
+    # process runs `benchcam end`, so its recorder has no in-memory handle
+    # (self._process is None) and must stop ffmpeg via the persisted pidfile.
+    monkeypatch.setattr("benchcam.recorders.ffmpeg.sys.platform", "linux")
+    (tmp_path / PIDFILE_FILENAME).write_text("4321\n", encoding="utf-8")
+
+    sent = []
+
+    def fake_kill(pid, sig):
+        sent.append((pid, sig))
+        # Alive until our SIGTERM lands, then liveness probes report it gone.
+        if sig == 0 and (pid, signal.SIGTERM) in sent:
+            raise ProcessLookupError
+
+    monkeypatch.setattr("benchcam.recorders.ffmpeg.os.kill", fake_kill)
+
+    rec = FfmpegRecorder()  # fresh instance — no Popen handle, like cmd_end
+    assert rec._process is None
+    rec.stop(tmp_path)  # must not raise
+
+    assert (4321, signal.SIGTERM) in sent  # signaled the persisted PID
+    # The pidfile is cleaned up once the process is gone.
+    assert not (tmp_path / PIDFILE_FILENAME).exists()
+
+
+def test_stop_via_pidfile_escalates_to_sigkill_when_sigterm_ignored(tmp_path, monkeypatch):
+    monkeypatch.setattr("benchcam.recorders.ffmpeg.sys.platform", "linux")
+    # Zero timeout: the SIGTERM wait returns after a single liveness probe, so
+    # the test escalates to SIGKILL immediately without spinning on the clock.
+    monkeypatch.setattr("benchcam.recorders.ffmpeg.STOP_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr("benchcam.recorders.ffmpeg.time.sleep", lambda _s: None)
+    (tmp_path / PIDFILE_FILENAME).write_text("4321\n", encoding="utf-8")
+
+    sent = []
+
+    def fake_kill(pid, sig):
+        sent.append((pid, sig))
+        # Stays alive through SIGTERM (sig 0 probes keep succeeding) until the
+        # SIGKILL, after which liveness probes report it gone.
+        if sig == 0 and (pid, EXPECTED_SIGKILL) in sent:
+            raise ProcessLookupError
+
+    monkeypatch.setattr("benchcam.recorders.ffmpeg.os.kill", fake_kill)
+
+    FfmpegRecorder().stop(tmp_path)
+
+    assert (4321, signal.SIGTERM) in sent
+    assert (4321, EXPECTED_SIGKILL) in sent  # escalated to SIGKILL
+    assert not (tmp_path / PIDFILE_FILENAME).exists()
+
+
+def test_stop_via_pidfile_missing_file_is_noop(tmp_path):
+    FfmpegRecorder().stop(tmp_path)  # no pidfile; must not raise
+
+
+def test_stop_via_pidfile_stale_pid_is_cleaned_up(tmp_path, monkeypatch):
+    (tmp_path / PIDFILE_FILENAME).write_text("999999\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "benchcam.recorders.ffmpeg.os.kill",
+        mock.Mock(side_effect=ProcessLookupError),  # process already gone
+    )
+    FfmpegRecorder().stop(tmp_path)  # must not raise
+    assert not (tmp_path / PIDFILE_FILENAME).exists()
 
 
 def test_stop_is_safe_when_never_started():
