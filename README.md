@@ -482,6 +482,29 @@ separate database.
 With the OBS recorder, **OBS itself is your live camera preview** next to the
 dashboard; BenchCam just drives OBS's record start/stop so markers stay aligned.
 
+The recorder dropdown defaults to the sensible choice for the machine: **ffmpeg**
+on Linux (the Raspberry Pi capture box) and **OBS** on Windows — so you don't
+have to pick it from the dropdown every time. Every recorder is still selectable.
+
+### Use it from your phone (LAN access)
+
+By default the dashboard binds to `127.0.0.1`, so it's reachable only from the
+machine it runs on. To open it from a **phone on the same Wi-Fi** (e.g. standing
+at the bench by the Pi), bind it to the LAN — this is **opt-in** because the
+dashboard has **no authentication**:
+
+```bash
+# On the Pi (headless): expose on the LAN, don't try to open a local browser.
+benchcam dashboard --lan --no-browser
+# Equivalent: benchcam dashboard --host 0.0.0.0
+# Or set it once:  export BENCHCAM_DASHBOARD_HOST=0.0.0.0
+```
+
+On startup it prints the actual phone-reachable URLs (the Pi's LAN IP and its
+`http://<hostname>.local:8765/` mDNS name) — open one of those on your phone. It
+never prints the bare `0.0.0.0` wildcard. **Only enable LAN access on a network
+you trust**, since anyone on that network can reach the (unauthenticated) UI.
+
 ### OBS password (no env var needed)
 
 You don't need to set `BENCHCAM_OBS_PASSWORD` before launching. When the OBS

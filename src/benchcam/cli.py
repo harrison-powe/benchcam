@@ -193,7 +193,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_root_arg(p_dash)
     p_dash.add_argument(
-        "--host", default=dashboard_mod.DEFAULT_HOST, help="Bind host (default: 127.0.0.1)."
+        "--host",
+        default=os.environ.get(dashboard_mod.ENV_DASHBOARD_HOST)
+        or dashboard_mod.DEFAULT_HOST,
+        help=(
+            "Bind host (default: 127.0.0.1, or $BENCHCAM_DASHBOARD_HOST). Use "
+            "0.0.0.0 to expose on the LAN — the dashboard has NO auth, so only "
+            "do this on a trusted network."
+        ),
+    )
+    p_dash.add_argument(
+        "--lan",
+        action="store_true",
+        help=(
+            "Bind to all interfaces (0.0.0.0) so a phone on the same Wi-Fi can "
+            "reach the dashboard. Shorthand for --host 0.0.0.0; overrides --host. "
+            "Opt-in only — the dashboard has no auth."
+        ),
     )
     p_dash.add_argument(
         "--port", type=int, default=dashboard_mod.DEFAULT_PORT,
@@ -300,8 +316,11 @@ def cmd_transcribe(args: argparse.Namespace) -> int:
 
 
 def cmd_dashboard(args: argparse.Namespace) -> int:
+    # --lan is the explicit, deliberate way to expose on the LAN; it overrides
+    # --host so a phone can reach the dashboard without remembering 0.0.0.0.
+    host = dashboard_mod.LAN_HOST if args.lan else args.host
     return dashboard_mod.serve(
-        host=args.host,
+        host=host,
         port=args.port,
         sessions_root=Path(args.sessions_root),
         open_browser=not args.no_browser,
