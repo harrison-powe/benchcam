@@ -382,6 +382,112 @@ def test_duplicate_launches_open_only_one_tab(monkeypatch, tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# Platform default recorder (ffmpeg on the Pi, OBS on Windows)
+# --------------------------------------------------------------------------- #
+
+def test_default_recorder_is_ffmpeg_on_linux(monkeypatch):
+    monkeypatch.setattr(dash.sys, "platform", "linux")
+    assert dash.default_recorder() == "ffmpeg"
+
+
+def test_default_recorder_is_obs_on_windows(monkeypatch):
+    monkeypatch.setattr(dash.sys, "platform", "win32")
+    assert dash.default_recorder() == "obs"
+
+
+def test_build_page_preselects_given_recorder():
+    html = dash.build_page(has_password=False, recorder="ffmpeg")
+    assert '<option value="ffmpeg" selected>' in html
+    assert '<option value="obs">' in html  # not selected
+    assert "<!--SEL_" not in html  # all markers substituted
+
+
+def test_render_page_preselects_platform_default_recorder(tmp_path, monkeypatch):
+    monkeypatch.setattr(dash.sys, "platform", "linux")
+    ctrl = DashboardController(tmp_path / "sessions", config_root=tmp_path)
+    html = ctrl.render_page()
+    assert '<option value="ffmpeg" selected>' in html
+
+
+def test_start_uses_platform_default_recorder_when_unspecified(monkeypatch, root):
+    monkeypatch.setattr(dash.sys, "platform", "linux")
+    rec = FakeRecorder()
+    _use_recorder(monkeypatch, rec)
+    ctrl = DashboardController(root)
+
+    status = ctrl.start("")  # no recorder picked -> platform default
+
+    assert status["recorder"] == "ffmpeg"
+    assert rec.start_calls == 1
+
+
+# --------------------------------------------------------------------------- #
+# LAN binding (opt-in) + reachable-URL reporting
+# --------------------------------------------------------------------------- #
+
+def test_lan_urls_never_include_wildcard(monkeypatch):
+    monkeypatch.setattr(dash, "_detect_lan_ip", lambda: "192.168.1.50")
+    monkeypatch.setattr(dash, "_hostname_local", lambda: "tatooine.local")
+    urls = dash.lan_urls(8765, "0.0.0.0")
+    assert "http://0.0.0.0:8765/" not in urls
+    assert "http://192.168.1.50:8765/" in urls
+    assert "http://tatooine.local:8765/" in urls
+
+
+def test_lan_urls_dedupe_and_explicit_host_first(monkeypatch):
+    monkeypatch.setattr(dash, "_detect_lan_ip", lambda: "192.168.1.50")
+    monkeypatch.setattr(dash, "_hostname_local", lambda: None)
+    urls = dash.lan_urls(8765, "192.168.1.50")
+    assert urls == ["http://192.168.1.50:8765/"]  # explicit host == detected IP, deduped
+
+
+def test_serve_prints_phone_reachable_urls_when_bound_to_lan(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(dash, "_open_marker_path", lambda port: tmp_path / "marker")
+    monkeypatch.setattr(dash, "is_dashboard_running", lambda *a, **k: False)
+    monkeypatch.setattr(dash, "make_server", lambda *a, **k: (_FakeHttpd(), None))
+    monkeypatch.setattr(dash, "_detect_lan_ip", lambda: "192.168.1.50")
+    monkeypatch.setattr(dash, "_hostname_local", lambda: "tatooine.local")
+
+    rc = dash.serve(host="0.0.0.0", port=8765, sessions_root=tmp_path, open_browser=False)
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "192.168.1.50:8765" in out
+    assert "tatooine.local:8765" in out
+    assert "0.0.0.0:8765" not in out  # never advertise the bind wildcard
+    assert "no auth" in out
+
+
+def test_serve_probes_and_opens_loopback_when_bound_to_wildcard(monkeypatch, tmp_path):
+    # 0.0.0.0 is not connectable: probing/opening must target 127.0.0.1.
+    monkeypatch.setattr(dash, "_open_marker_path", lambda port: tmp_path / "marker")
+    probed = {}
+    monkeypatch.setattr(dash, "is_dashboard_running", lambda host, port, *a, **k: probed.setdefault("host", host) or False)
+    monkeypatch.setattr(dash, "make_server", lambda *a, **k: (_FakeHttpd(), None))
+    monkeypatch.setattr(dash, "_detect_lan_ip", lambda: None)
+    monkeypatch.setattr(dash, "_hostname_local", lambda: None)
+    opened = []
+    monkeypatch.setattr(dash.webbrowser, "open", lambda u: opened.append(u))
+
+    dash.serve(host="0.0.0.0", port=8765, sessions_root=tmp_path, open_browser=True)
+
+    assert probed["host"] == "127.0.0.1"
+    assert opened == ["http://127.0.0.1:8765/"]
+
+
+def test_serve_localhost_does_not_print_lan_urls(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(dash, "_open_marker_path", lambda port: tmp_path / "marker")
+    monkeypatch.setattr(dash, "is_dashboard_running", lambda *a, **k: False)
+    monkeypatch.setattr(dash, "make_server", lambda *a, **k: (_FakeHttpd(), None))
+
+    dash.serve(host="127.0.0.1", port=8765, sessions_root=tmp_path, open_browser=False)
+
+    out = capsys.readouterr().out
+    assert "On your phone" not in out
+    assert "http://127.0.0.1:8765/" in out
+
+
+# --------------------------------------------------------------------------- #
 # Cleanup 2 — hide the password field when one is saved
 # --------------------------------------------------------------------------- #
 

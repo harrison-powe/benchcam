@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from benchcam import dashboard as dashboard_mod
 from benchcam import session as session_mod
 from benchcam.cli import main
 from benchcam.markers import read_markers
@@ -55,3 +56,34 @@ def test_run_with_obs_reports_clear_error_without_extra(tmp_path, capsys):
     assert rc == 1
     err = capsys.readouterr().err.lower()
     assert "obs" in err
+
+
+def test_dashboard_lan_flag_binds_to_all_interfaces(tmp_path, monkeypatch):
+    # --lan must expose on the LAN (0.0.0.0); default stays localhost-only.
+    captured = {}
+    monkeypatch.setattr(
+        dashboard_mod, "serve",
+        lambda **kw: captured.update(kw) or 0,
+    )
+    rc = main(["dashboard", "--sessions-root", str(tmp_path), "--lan", "--no-browser"])
+    assert rc == 0
+    assert captured["host"] == "0.0.0.0"
+    assert captured["open_browser"] is False
+
+
+def test_dashboard_defaults_to_localhost(tmp_path, monkeypatch):
+    captured = {}
+    monkeypatch.delenv(dashboard_mod.ENV_DASHBOARD_HOST, raising=False)
+    monkeypatch.setattr(dashboard_mod, "serve", lambda **kw: captured.update(kw) or 0)
+    rc = main(["dashboard", "--sessions-root", str(tmp_path), "--no-browser"])
+    assert rc == 0
+    assert captured["host"] == "127.0.0.1"
+
+
+def test_dashboard_host_env_var_sets_bind_host(tmp_path, monkeypatch):
+    monkeypatch.setenv(dashboard_mod.ENV_DASHBOARD_HOST, "0.0.0.0")
+    captured = {}
+    monkeypatch.setattr(dashboard_mod, "serve", lambda **kw: captured.update(kw) or 0)
+    rc = main(["dashboard", "--sessions-root", str(tmp_path), "--no-browser"])
+    assert rc == 0
+    assert captured["host"] == "0.0.0.0"

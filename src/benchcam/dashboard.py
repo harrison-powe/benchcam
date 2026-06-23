@@ -17,15 +17,18 @@ The dashboard is a launch/start/stop/review + click-to-mark convenience. For
 fast hands-busy marking, ``benchcam live`` in a terminal is still the quickest
 path; the dashboard does not replace it.
 
-Local-only (127.0.0.1), no auth, stdlib only (http.server, json, webbrowser).
-The OBS client stays the isolated optional extra (imported only when the OBS
-recorder is actually used).
+Local-only by default (127.0.0.1), no auth, stdlib only (http.server, json,
+webbrowser). LAN access (so a phone at the bench can reach it) is OPT-IN via
+``--lan`` / ``--host 0.0.0.0`` / ``BENCHCAM_DASHBOARD_HOST`` — never the default,
+since the dashboard has no auth. The OBS client stays the isolated optional extra
+(imported only when the OBS recorder is actually used).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -49,6 +52,86 @@ from .session import SessionError
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 RECORDER_CHOICES = ("obs", "ffmpeg", "null")
+#: Bind to every interface so a phone on the same Wi-Fi can reach the dashboard.
+#: Opt-in only (``--lan`` / ``--host 0.0.0.0`` / the env var) — never the default.
+LAN_HOST = "0.0.0.0"
+#: Optional env var to set the dashboard bind host without a flag (e.g. on the Pi).
+ENV_DASHBOARD_HOST = "BENCHCAM_DASHBOARD_HOST"
+
+
+def default_recorder() -> str:
+    """Sensible default recorder for this platform.
+
+    On Linux (the Raspberry Pi capture box) the ffmpeg V4L2/ALSA path is the
+    working capture path, so default to it; on Windows OBS stays the default.
+    This is only the *default* selection — every recorder is still selectable in
+    the UI and via the ``recorder`` field of ``/api/start``.
+    """
+    return "ffmpeg" if sys.platform.startswith("linux") else "obs"
+
+
+def _is_wildcard_host(host: str) -> bool:
+    """True if ``host`` is a bind-only wildcard (not a connectable address)."""
+    return (host or "").strip() in ("", "0.0.0.0", "::")
+
+
+def _is_localhost_host(host: str) -> bool:
+    """True if ``host`` is a loopback address (no LAN exposure)."""
+    return (host or "").strip() in ("127.0.0.1", "localhost", "::1")
+
+
+def _detect_lan_ip() -> str | None:
+    """Best-effort primary LAN IPv4 of this machine, or None if undetectable.
+
+    Uses the standard UDP-connect trick: opening a datagram socket toward a
+    public address makes the OS pick the outbound interface without sending any
+    packet, so it works offline as long as a default route exists.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("8.8.8.8", 80))
+        return sock.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        sock.close()
+
+
+def _hostname_local() -> str | None:
+    """``<hostname>.local`` (mDNS/avahi) for this machine, or None if unknown."""
+    try:
+        name = socket.gethostname()
+    except OSError:
+        return None
+    name = (name or "").split(".")[0].strip()
+    return f"{name}.local" if name else None
+
+
+def lan_urls(port: int, bind_host: str = LAN_HOST) -> list[str]:
+    """Phone-reachable URLs for a LAN-bound dashboard, newest-friendly first.
+
+    Includes an explicit (non-wildcard) bind host, the detected LAN IP, and the
+    ``<hostname>.local`` mDNS name, de-duplicated in that order. Never includes
+    ``0.0.0.0`` — that is a bind wildcard, not something a phone can open.
+    """
+    candidates: list[str] = []
+    if bind_host and not _is_wildcard_host(bind_host) and not _is_localhost_host(bind_host):
+        candidates.append(bind_host)
+    ip = _detect_lan_ip()
+    if ip:
+        candidates.append(ip)
+    host_local = _hostname_local()
+    if host_local:
+        candidates.append(host_local)
+
+    seen: set[str] = set()
+    urls: list[str] = []
+    for host in candidates:
+        url = f"http://{host}:{port}/"
+        if url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls
 
 
 class DashboardError(RuntimeError):
@@ -101,7 +184,7 @@ class DashboardController:
     def render_page(self) -> str:
         """Build the dashboard HTML, reflecting whether a password is saved."""
         has_pw = bool(config_mod.load_config(self._config_root).get("obs", {}).get("password"))
-        return build_page(has_pw)
+        return build_page(has_pw, recorder=default_recorder())
 
     def status(self) -> dict:
         if self._session is None:
@@ -129,7 +212,7 @@ class DashboardController:
     # -- actions -------------------------------------------------------------
     def start(
         self,
-        recorder_name: str = "obs",
+        recorder_name: str = "",
         profile: str = "default",
         *,
         name: str = "",
@@ -142,7 +225,8 @@ class DashboardController:
                 f"A session ({self._session.session_id}) is already active. "
                 "Stop it before starting another."
             )
-        recorder_name = (recorder_name or "obs").strip().lower()
+        # Empty recorder -> the platform default (ffmpeg on the Pi, OBS on Windows).
+        recorder_name = (recorder_name or default_recorder()).strip().lower()
         profile = (profile or "default").strip() or "default"
 
         if recorder_name == "obs":
@@ -542,7 +626,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         payload = self._read_json()
         routes = {
             "/api/start": lambda p: self.controller.start(
-                p.get("recorder", "obs"),
+                p.get("recorder", ""),
                 p.get("profile", "default"),
                 name=p.get("name", ""),
                 obs_password=p.get("obs_password") or None,
@@ -687,11 +771,17 @@ def serve(
     sessions_root: Path | str,
     open_browser: bool = True,
 ) -> int:
-    url = f"http://{host}:{port}/"
+    # ``host`` is what we BIND to (may be the 0.0.0.0 wildcard); for probing a
+    # running dashboard and for opening a local browser we need a CONNECTABLE
+    # address, so fall back to loopback when the bind host is a wildcard.
+    local_host = "127.0.0.1" if _is_wildcard_host(host) else host
+    url = f"http://{local_host}:{port}/"
+    # LAN-bound = the BIND host is not loopback (wildcard or an explicit LAN IP).
+    lan_bound = not _is_localhost_host(host)
 
     # Idempotent launch: if a dashboard is already running, just open the browser
     # to it instead of spawning a duplicate server (avoids piles of pythonw.exe).
-    if is_dashboard_running(host, port):
+    if is_dashboard_running(local_host, port):
         print(f"BenchCam dashboard is already running at {url}; opening it.")
         if open_browser:
             open_dashboard_once(url, port)
@@ -706,6 +796,13 @@ def serve(
         ) from exc
 
     print(f"BenchCam dashboard running at {url}")
+    if lan_bound:
+        # Bound to the LAN: print the URLs a phone on the same Wi-Fi can open,
+        # never the bare 0.0.0.0 wildcard.
+        print("On your phone (same network), open one of:")
+        for lan_url in lan_urls(port, host) or [url]:
+            print(f"  {lan_url}")
+        print("  (no auth — only enable LAN access on a network you trust)")
     print("Keep this window open. Close it (or press Ctrl+C) to stop the dashboard.")
     if open_browser:
         open_dashboard_once(url, port)
@@ -798,9 +895,9 @@ PAGE_HTML = """<!doctype html>
       <div>
         <label for="recorder">Recorder</label>
         <select id="recorder">
-          <option value="obs" selected>OBS (camera preview in OBS)</option>
-          <option value="ffmpeg">ffmpeg (webcam direct)</option>
-          <option value="null">null (markers only)</option>
+          <option value="obs"<!--SEL_OBS-->>OBS (camera preview in OBS)</option>
+          <option value="ffmpeg"<!--SEL_FFMPEG-->>ffmpeg (webcam direct)</option>
+          <option value="null"<!--SEL_NULL-->>null (markers only)</option>
         </select>
       </div>
       <div>
@@ -1191,7 +1288,19 @@ _OBS_PW_SAVED = (
 )
 
 
-def build_page(has_password: bool) -> str:
-    """Render the dashboard HTML, omitting the password input when one is saved."""
+def build_page(has_password: bool, recorder: str | None = None) -> str:
+    """Render the dashboard HTML.
+
+    Omits the OBS password input when one is saved, and pre-selects the recorder
+    dropdown to ``recorder`` (the platform default — ffmpeg on the Pi) so the user
+    doesn't have to pick it from the dropdown every time.
+    """
     block = _OBS_PW_SAVED if has_password else _OBS_PW_INPUT
-    return PAGE_HTML.replace("<!--OBS_PW_BLOCK-->", block)
+    chosen = (recorder or default_recorder()).strip().lower()
+    if chosen not in RECORDER_CHOICES:
+        chosen = default_recorder()
+    html = PAGE_HTML.replace("<!--OBS_PW_BLOCK-->", block)
+    for value in RECORDER_CHOICES:
+        marker = f"<!--SEL_{value.upper()}-->"
+        html = html.replace(marker, " selected" if value == chosen else "")
+    return html
