@@ -7,6 +7,7 @@ Commands:
     benchcam live           interactive single-keypress marking shell
     benchcam end            stop recording and close the active session
     benchcam edit           render a marker-aware review.mp4 for a session
+    benchcam transcribe     auto-label markers from spoken narration (Whisper)
     benchcam dashboard      local web UI: start/mark/stop/review in a browser
 
 Each command is a separate process, so the "active" session is tracked on disk
@@ -26,11 +27,13 @@ from . import editor as editor_mod
 from . import keypress
 from . import live as live_mod
 from . import session as session_mod
+from . import transcribe as transcribe_mod
 from .dashboard import DashboardError
 from .editor import EditError
 from .recorders import get_recorder
 from .recorders.base import RecorderError
 from .session import SessionError
+from .transcribe import TranscribeError
 
 
 ENV_SESSIONS_ROOT = "BENCHCAM_SESSIONS_ROOT"
@@ -150,6 +153,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_edit.set_defaults(func=cmd_edit)
 
+    # transcribe
+    p_tr = sub.add_parser(
+        "transcribe",
+        help="Auto-label markers from spoken narration using Whisper "
+        "(runs on the laptop; needs the [transcribe] extra).",
+    )
+    _add_root_arg(p_tr)
+    p_tr.add_argument(
+        "--session",
+        default=None,
+        help="Session id or folder path to transcribe (default: newest session).",
+    )
+    p_tr.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "Whisper model name, e.g. tiny/base/small/medium/large "
+            f"(default: $BENCHCAM_WHISPER_MODEL or {transcribe_mod.DEFAULT_MODEL})."
+        ),
+    )
+    p_tr.add_argument(
+        "--window",
+        type=float,
+        default=transcribe_mod.DEFAULT_WINDOW,
+        help="Seconds before/after each marker to pull narration from (default: 5).",
+    )
+    p_tr.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace existing marker labels too (default: only fill empty ones).",
+    )
+    p_tr.set_defaults(func=cmd_transcribe)
+
     # dashboard
     p_dash = sub.add_parser(
         "dashboard",
@@ -250,6 +286,19 @@ def cmd_edit(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_transcribe(args: argparse.Namespace) -> int:
+    session_dir = editor_mod.resolve_session_dir(
+        Path(args.sessions_root), args.session
+    )
+    transcribe_mod.run_transcribe(
+        session_dir,
+        model=args.model,
+        window=args.window,
+        overwrite=args.overwrite,
+    )
+    return 0
+
+
 def cmd_dashboard(args: argparse.Namespace) -> int:
     return dashboard_mod.serve(
         host=args.host,
@@ -264,7 +313,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except (SessionError, RecorderError, EditError, DashboardError) as exc:
+    except (
+        SessionError,
+        RecorderError,
+        EditError,
+        DashboardError,
+        TranscribeError,
+    ) as exc:
         print(f"benchcam: {exc}", file=sys.stderr)
         return 1
 

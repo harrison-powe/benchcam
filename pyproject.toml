@@ -18,6 +18,11 @@ dependencies = []
 # lazily inside benchcam/recorders/obs.py, so 'pip install benchcam' (without
 # [obs]) never pulls in or requires obsws-python.
 obs = ["obsws-python>=1.7"]
+# Local Whisper transcription for 'benchcam transcribe' only. Imported lazily
+# inside benchcam/transcribe.py, so 'pip install benchcam' (without [transcribe])
+# never pulls in openai-whisper or torch. Keep this OFF the Raspberry Pi install —
+# it is meant for the laptop that has the GPU/RAM to run Whisper.
+transcribe = ["openai-whisper>=20231117"]
 dev = ["pytest>=7"]
 
 [project.scripts]

@@ -81,13 +81,19 @@ def append_marker(path: Path, marker: Marker) -> None:
         writer.writerow(marker.as_row())
 
 
-def set_marker_label(path: Path, marker_index: int, label: str) -> bool:
+def set_marker_label(
+    path: Path, marker_index: int, label: str, source: str | None = None
+) -> bool:
     """Set the label of an existing marker (by index) and rewrite ``markers.csv``.
 
     Lets a marker be created instantly (no label) and labeled afterward. Only the
-    ``label`` field changes; the columns and the other values (including the
-    formatted ``elapsed_seconds`` text) are preserved exactly. Returns True if a
-    matching marker was found and updated.
+    ``label`` field changes (and ``source`` if ``source`` is given); the columns
+    and the other values (including the formatted ``elapsed_seconds`` text) are
+    preserved exactly. ``source`` is optional so existing callers that only edit
+    the label (e.g. the dashboard) are unaffected; ``benchcam transcribe`` passes
+    it to record that the label came from audio transcription without losing the
+    marker's original origin. Returns True if a matching marker was found and
+    updated.
     """
     path = Path(path)
     rows = read_markers(path)
@@ -95,6 +101,8 @@ def set_marker_label(path: Path, marker_index: int, label: str) -> bool:
     for row in rows:
         if str(row.get("marker_index")) == str(marker_index):
             row["label"] = label
+            if source is not None:
+                row["source"] = source
             found = True
     if not found:
         return False
