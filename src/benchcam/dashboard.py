@@ -410,6 +410,21 @@ class DashboardController:
 
     # -- helpers -------------------------------------------------------------
     def _render_review(self, folder, pre, post, speed) -> dict:
+        # Heavy compute (the H.264 transcode) belongs on the laptop, not the 2GB
+        # Pi — so on Linux we refuse to run_edit and hand back the exact command
+        # to run on the laptop instead. Detected at call-time (so tests can
+        # monkeypatch sys.platform) the same way default_recorder() does.
+        if sys.platform.startswith("linux"):
+            session_id = Path(folder).name
+            return {
+                "blocked_on_pi": True,
+                "session_id": session_id,
+                "message": (
+                    "Rendering runs on the laptop (faster, and keeps the Pi free "
+                    "for capture). On the laptop, run:  "
+                    f"benchcam edit --session {session_id}"
+                ),
+            }
         output = editor_mod.run_edit(
             folder, pre=pre, post=post, speed=speed, out=lambda _m: None
         )
@@ -1246,7 +1261,7 @@ function libraryRow(s){
     tdAct.appendChild(mkBtn("Make review", "", async (e) => {
       const b = e.target; b.disabled = true; b.textContent = "Rendering…";
       const d = await api("/api/make_review", Object.assign({session: s.session_id}, reviewParams()));
-      if (d.ok) $("reviewOut").textContent = "review.mp4: " + d.review_path;
+      if (d.ok) $("reviewOut").textContent = d.blocked_on_pi ? d.message : ("review.mp4: " + d.review_path);
       await loadLibrary();
     }));
   }

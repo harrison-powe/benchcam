@@ -204,6 +204,7 @@ def test_label_marker_unknown_index_raises(monkeypatch, root):
 
 
 def test_review_calls_edit_on_last_session(monkeypatch, root):
+    monkeypatch.setattr(dash.sys, "platform", "win32")  # local-render (non-Pi) path
     _use_recorder(monkeypatch, FakeRecorder())
     ctrl = DashboardController(root)
     started = ctrl.start("obs", "p")
@@ -231,8 +232,60 @@ def test_review_without_finished_session_raises(root):
         ctrl.review()
 
 
+def test_render_review_blocked_on_pi_does_not_run_edit(monkeypatch, root):
+    # On the Pi (Linux), the heavy H.264 transcode must NOT run in-process — the
+    # render is routed to the laptop. Return guidance instead of calling run_edit.
+    monkeypatch.setattr(dash.sys, "platform", "linux")
+    _use_recorder(monkeypatch, FakeRecorder())
+    ctrl = DashboardController(root)
+    started = ctrl.start("ffmpeg", "p")
+    ctrl.stop()
+
+    called = {"n": 0}
+
+    def fake_run_edit(*a, **k):
+        called["n"] += 1
+        return "should-not-happen"
+
+    monkeypatch.setattr(editor_mod, "run_edit", fake_run_edit)
+
+    res = ctrl.review()
+
+    assert called["n"] == 0  # run_edit never invoked on the Pi
+    assert res["blocked_on_pi"] is True
+    session_id = Path(started["folder"]).name
+    assert res["session_id"] == session_id
+    assert f"benchcam edit --session {session_id}" in res["message"]
+    assert ctrl._last_review is None  # status poll stays a no-op on the Pi
+
+
+def test_render_review_runs_edit_on_windows(monkeypatch, root):
+    # Non-Linux (Windows): behavior unchanged — run_edit still runs locally.
+    monkeypatch.setattr(dash.sys, "platform", "win32")
+    _use_recorder(monkeypatch, FakeRecorder())
+    ctrl = DashboardController(root)
+    started = ctrl.start("obs", "p")
+    ctrl.stop()
+
+    captured = {}
+
+    def fake_run_edit(session_dir, *, pre, post, speed, out):
+        captured["dir"] = str(session_dir)
+        return f"{session_dir}/review.mp4"
+
+    monkeypatch.setattr(editor_mod, "run_edit", fake_run_edit)
+    monkeypatch.setattr(dash, "open_file", lambda p: None)
+
+    res = ctrl.review()
+
+    assert captured["dir"] == started["folder"]  # run_edit invoked locally
+    assert res["review_path"].endswith("review.mp4")
+    assert "blocked_on_pi" not in res
+
+
 def test_review_auto_opens_the_clip(monkeypatch, root):
     # Fix 4: review() opens the rendered file in the default player.
+    monkeypatch.setattr(dash.sys, "platform", "win32")  # local-render (non-Pi) path
     _use_recorder(monkeypatch, FakeRecorder())
     ctrl = DashboardController(root)
     started = ctrl.start("obs", "p")
@@ -250,6 +303,7 @@ def test_review_auto_opens_the_clip(monkeypatch, root):
 
 
 def test_review_open_failure_is_nonfatal_and_keeps_link(monkeypatch, root):
+    monkeypatch.setattr(dash.sys, "platform", "win32")  # local-render (non-Pi) path
     _use_recorder(monkeypatch, FakeRecorder())
     ctrl = DashboardController(root)
     ctrl.start("obs", "p")
@@ -587,6 +641,7 @@ def test_open_review_existing_and_missing(tmp_path, monkeypatch):
 
 
 def test_make_review_for_session_runs_edit_and_opens(tmp_path, monkeypatch):
+    monkeypatch.setattr(dash.sys, "platform", "win32")  # local-render (non-Pi) path
     root = tmp_path / "sessions"
     s = session_mod.create_session(root=root)
     (s.folder / "capture.mp4").write_bytes(b"v")
