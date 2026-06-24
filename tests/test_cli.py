@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import argparse
+
+from benchcam import cli as cli_mod
 from benchcam import dashboard as dashboard_mod
 from benchcam import session as session_mod
-from benchcam.cli import main
+from benchcam.cli import cmd_fetch, main
 from benchcam.markers import read_markers
 
 
@@ -87,3 +90,38 @@ def test_dashboard_host_env_var_sets_bind_host(tmp_path, monkeypatch):
     rc = main(["dashboard", "--sessions-root", str(tmp_path), "--no-browser"])
     assert rc == 0
     assert captured["host"] == "0.0.0.0"
+
+
+def test_fetch_invokes_scp_with_remote_and_dest(tmp_path, monkeypatch):
+    # fetch must scp the right "host:remote-root/<session>" to the local
+    # sessions root, without performing a real copy or opening anything.
+    session_id = "2026-06-23_20-17-17"
+    root = tmp_path / "sessions"
+    recorded = {}
+
+    def fake_run(argv, *args, **kwargs):
+        recorded["argv"] = argv
+        return argparse.Namespace(returncode=0)
+
+    monkeypatch.setattr(cli_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli_mod.subprocess, "Popen", lambda *a, **k: None)
+    monkeypatch.setattr(cli_mod.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(cli_mod.os, "startfile", lambda *a, **k: None, raising=False)
+
+    args = argparse.Namespace(
+        sessions_root=str(root),
+        session=session_id,
+        host="harrison@tatooine.local",
+        remote_root="/home/harrison/benchcam/sessions",
+        no_open=False,
+    )
+    rc = cmd_fetch(args)
+    assert rc == 0
+
+    argv = recorded["argv"]
+    assert argv[0] == "scp"
+    assert (
+        f"harrison@tatooine.local:/home/harrison/benchcam/sessions/{session_id}"
+        in argv
+    )
+    assert str(root) in argv

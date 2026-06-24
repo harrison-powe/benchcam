@@ -9,6 +9,7 @@ Commands:
     benchcam edit           render a marker-aware review.mp4 for a session
     benchcam transcribe     auto-label markers from spoken narration (Whisper)
     benchcam dashboard      local web UI: start/mark/stop/review in a browser
+    benchcam fetch          (laptop) pull a session from the Pi over scp and open it
 
 Each command is a separate process, so the "active" session is tracked on disk
 via a small pointer file (see session.py). State lives in plain local files.
@@ -18,6 +19,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -221,6 +224,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_dash.set_defaults(func=cmd_dashboard)
 
+    # fetch
+    p_fetch = sub.add_parser(
+        "fetch",
+        help="Pull a recorded session from the Pi over scp to this laptop and "
+        "open it (run on the laptop).",
+    )
+    _add_root_arg(p_fetch)
+    p_fetch.add_argument(
+        "session", help="Session id to fetch, e.g. 2026-06-23_20-17-17."
+    )
+    p_fetch.add_argument(
+        "--host",
+        default="harrison@tatooine.local",
+        help="SSH host of the Pi (default: harrison@tatooine.local).",
+    )
+    p_fetch.add_argument(
+        "--remote-root",
+        default="/home/harrison/benchcam/sessions",
+        help=(
+            "Absolute sessions root on the Pi "
+            "(default: /home/harrison/benchcam/sessions)."
+        ),
+    )
+    p_fetch.add_argument(
+        "--no-open",
+        action="store_true",
+        help="Copy only; do not open the folder or VLC afterwards.",
+    )
+    p_fetch.set_defaults(func=cmd_fetch)
+
     return parser
 
 
@@ -325,6 +358,61 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         sessions_root=Path(args.sessions_root),
         open_browser=not args.no_browser,
     )
+
+
+def cmd_fetch(args: argparse.Namespace) -> int:
+    # Runs on the laptop: the dashboard is served from a headless Pi, so its
+    # "Open video"/"Open folder" buttons can't reach the laptop's screen. Pull
+    # the session folder here over scp, then open it locally to watch/edit.
+    dest_root = Path(args.sessions_root)
+    dest_root.mkdir(parents=True, exist_ok=True)
+
+    remote = f"{args.host}:{args.remote_root}/{args.session}"
+    try:
+        # Windows 10/11 ships OpenSSH scp on PATH.
+        subprocess.run(["scp", "-r", remote, str(dest_root)], check=True)
+    except subprocess.CalledProcessError:
+        print(
+            f"scp failed — check the session id and that {args.host} is reachable"
+        )
+        return 1
+
+    dest_dir = dest_root / args.session
+    capture = dest_dir / "capture.mkv"
+    print(f"Fetched {args.session} -> {dest_dir.resolve()}")
+
+    if args.no_open:
+        return 0
+
+    # Best-effort opening: a failure here must never fail the command now that
+    # the copy succeeded — warn and keep going.
+    if os.name == "nt":
+        try:
+            os.startfile(dest_dir)  # type: ignore[attr-defined]
+        except OSError as exc:
+            print(f"warning: could not open folder: {exc}")
+
+    try:
+        vlc = shutil.which("vlc")
+        if not vlc:
+            for candidate in (
+                r"C:\Program Files\VideoLAN\VLC\vlc.exe",
+                r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe",
+            ):
+                if os.path.exists(candidate):
+                    vlc = candidate
+                    break
+        if vlc and capture.exists():
+            subprocess.Popen([vlc, str(capture)])
+        elif capture.exists():
+            os.startfile(capture)  # type: ignore[attr-defined]
+            print("VLC not found — opened with default player")
+        else:
+            print("no capture.mkv in this session")
+    except OSError as exc:
+        print(f"warning: could not open video: {exc}")
+
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
