@@ -180,6 +180,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_tr.add_argument(
+        "--language",
+        default=transcribe_mod.DEFAULT_LANGUAGE,
+        help=(
+            "Language for Whisper, e.g. en/English (default: en). Pinning it "
+            "avoids misdetection on short/quiet narration; pass '' to auto-detect."
+        ),
+    )
+    p_tr.add_argument(
         "--window",
         type=float,
         default=transcribe_mod.DEFAULT_WINDOW,
@@ -379,6 +387,7 @@ def cmd_transcribe(args: argparse.Namespace) -> int:
     transcribe_mod.run_transcribe(
         session_dir,
         model=args.model,
+        language=args.language,
         window=args.window,
         overwrite=args.overwrite,
     )

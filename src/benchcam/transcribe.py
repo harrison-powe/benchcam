@@ -46,8 +46,15 @@ from typing import Callable
 from .editor import find_capture, probe_has_audio
 from .markers import MARKERS_FILENAME, read_markers, update_marker
 
-DEFAULT_MODEL = "base"
+#: "small" balances accuracy and speed well on a laptop GPU (e.g. an RTX 2000
+#: Ada); "base" was too small and misdetected/hallucinated. Override with --model
+#: (e.g. "medium" for more accuracy, "base"/"tiny" for a faster, rougher pass).
+DEFAULT_MODEL = "small"
 ENV_MODEL = "BENCHCAM_WHISPER_MODEL"
+#: Whisper auto-detects language by default, which can misfire on short/quiet
+#: narration (e.g. flag English as Norwegian and hallucinate). Pinning it to
+#: English removes that failure mode; override with --language for other audio.
+DEFAULT_LANGUAGE = "en"
 DEFAULT_WINDOW = 5.0
 
 #: Appended to a marker's ``source`` when transcription fills its label.
@@ -108,15 +115,18 @@ def _import_whisper():
     return whisper
 
 
-def transcribe_audio(capture: Path | str, model: str) -> list[TranscriptSegment]:
+def transcribe_audio(
+    capture: Path | str, model: str, *, language: str = DEFAULT_LANGUAGE
+) -> list[TranscriptSegment]:
     """Run Whisper on ``capture`` and return its timestamped segments.
 
     Whisper loads the audio from the (video) file via ffmpeg, so the capture path
-    is passed through directly.
+    is passed through directly. ``language`` is passed to Whisper to skip (often
+    wrong) auto-detection; an empty/None value lets Whisper auto-detect.
     """
     whisper = _import_whisper()
     loaded = whisper.load_model(model)
-    result = loaded.transcribe(str(capture))
+    result = loaded.transcribe(str(capture), language=language or None)
     segments: list[TranscriptSegment] = []
     for seg in result.get("segments", []) or []:
         try:
@@ -222,13 +232,16 @@ def run_transcribe(
     session_dir: Path | str,
     *,
     model: str | None = None,
+    language: str = DEFAULT_LANGUAGE,
     window: float = DEFAULT_WINDOW,
     overwrite: bool = False,
     out: Callable[[str], object] = print,
 ) -> list[NarrationAssignment]:
     """Transcribe a session's audio into each marker's ``narration`` column.
 
-    Returns the assignments that were written (empty if nothing changed).
+    ``language`` pins Whisper's language (default English) to avoid misdetection;
+    pass an empty string to let Whisper auto-detect. Returns the assignments that
+    were written (empty if nothing changed).
     """
     session_dir = Path(session_dir)
     if window < 0:
@@ -253,8 +266,11 @@ def run_transcribe(
         return []
 
     model_name = resolve_model(model)
-    out(f"Transcribing {capture} with Whisper model {model_name!r} (this can take a while)...")
-    segments = transcribe_audio(capture, model_name)
+    out(
+        f"Transcribing {capture} with Whisper model {model_name!r} "
+        f"(language={language or 'auto'}) (this can take a while)..."
+    )
+    segments = transcribe_audio(capture, model_name, language=language)
     out(f"Got {len(segments)} transcript segment(s).")
 
     assignments = plan_narrations(
