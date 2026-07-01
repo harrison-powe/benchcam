@@ -58,11 +58,17 @@ class EditError(RuntimeError):
 
 @dataclass
 class Caption:
-    """A burned-in label, timed in segment-local seconds (after speed re-timing)."""
+    """A burned-in label, timed in segment-local seconds (after speed re-timing).
+
+    ``accent`` is an optional leading substring of ``text`` (the chapter number)
+    that is re-drawn in a dim colour on top, at the same anchor, so the number
+    reads as a muted marker and the label is the emphasis. Empty = single colour.
+    """
 
     text: str
     start: float
     end: float
+    accent: str = ""
 
 
 @dataclass
@@ -218,7 +224,8 @@ def _attach_chapter_captions(
     number prefix is baked into the caption text (escaped later by drawtext).
     """
     for chapter in _chapters(events, duration, pre):
-        text = f"{chapter.number:02d}{_CAPTION_NUMBER_SEP}{chapter.label}"
+        accent = f"{chapter.number:02d}"  # dim-overdrawn leading number
+        text = f"{accent}{_CAPTION_NUMBER_SEP}{chapter.label}"
         for seg in segments:
             lo = max(chapter.src_start, seg.start)
             hi = min(chapter.src_end, seg.end)
@@ -226,7 +233,9 @@ def _attach_chapter_captions(
                 continue
             local_start = (lo - seg.start) / seg.speed
             local_end = (hi - seg.start) / seg.speed
-            seg.captions.append(Caption(text=text, start=local_start, end=local_end))
+            seg.captions.append(
+                Caption(text=text, start=local_start, end=local_end, accent=accent)
+            )
 
 
 def describe_plan(
@@ -305,30 +314,56 @@ def _escape_fontfile(fontfile: str) -> str:
 # are knobs to tune after eyeballing a render; timing is a hard cut (no fade).
 _CAPTION_FONTSIZE = 32  # legible at 1080p (~3% of frame height)
 _CAPTION_MARGIN = 64  # pixels inset from the top-left corner
-_CAPTION_FONTCOLOR = "white"
+_CAPTION_FONTCOLOR = "0xF5F0E8"  # warm off-white label (softer than pure white)
+_CAPTION_NUMBER_COLOR = "0x9E948A"  # muted/dim colour for the ordinal number
 _CAPTION_BOXCOLOR = "black@0.62"  # semi-transparent backing box for legibility
-_CAPTION_BOXBORDERW = 22  # generous padding so it reads as a designed tag
+# Box padding as "vertical|horizontal" (needs an ffmpeg whose drawtext takes a
+# string boxborderw, e.g. 8.x); wider sides give the tag horizontal breathing room.
+_CAPTION_BOXBORDERW = "16|28"
+# Size/position the box from the FONT's line metrics rather than each string's
+# tight glyph bbox, so every chapter box is the SAME height (width still varies).
+# Without this, labels with descenders ('p', 'g') get taller boxes. Needs ffmpeg
+# 8.x drawtext (older builds lack the y_align option).
+_CAPTION_Y_ALIGN = "font"
 _CAPTION_NUMBER_SEP = " · "  # between the zero-padded chapter number and the label
 
 
 def _drawtext_filter(caption: Caption, fontfile: str | None) -> str:
-    # expansion=none keeps labels literal (no %{...} expansion / "Stray %").
-    parts = [f"text={_escape_drawtext(caption.text)}", "expansion=none"]
-    if fontfile:
-        parts.append(f"fontfile={_escape_fontfile(fontfile)}")
-    parts += [
-        f"fontcolor={_CAPTION_FONTCOLOR}",
-        f"fontsize={_CAPTION_FONTSIZE}",
-        "box=1",
-        f"boxcolor={_CAPTION_BOXCOLOR}",
-        f"boxborderw={_CAPTION_BOXBORDERW}",
-        # Top-left chapter tag (was bottom-centre). Fixed-pixel margin.
-        f"x={_CAPTION_MARGIN}",
-        f"y={_CAPTION_MARGIN}",
-        # Escape the commas so the filtergraph parser keeps them inside between().
-        f"enable=between(t\\,{caption.start:.3f}\\,{caption.end:.3f})",
-    ]
-    return "drawtext=" + ":".join(parts)
+    # Escape the commas so the filtergraph parser keeps them inside between().
+    enable = f"enable=between(t\\,{caption.start:.3f}\\,{caption.end:.3f})"
+    font = f"fontfile={_escape_fontfile(fontfile)}" if fontfile else None
+
+    def _one(text: str, fontcolor: str, *, box: bool) -> str:
+        # expansion=none keeps labels literal (no %{...} expansion / "Stray %").
+        parts = [f"text={_escape_drawtext(text)}", "expansion=none"]
+        if font:
+            parts.append(font)
+        parts += [f"fontcolor={fontcolor}", f"fontsize={_CAPTION_FONTSIZE}"]
+        if box:
+            parts += [
+                "box=1",
+                f"boxcolor={_CAPTION_BOXCOLOR}",
+                f"boxborderw={_CAPTION_BOXBORDERW}",
+            ]
+        # Top-left chapter tag (was bottom-centre). Fixed-pixel margin. y_align=font
+        # keeps the box height constant across labels (see _CAPTION_Y_ALIGN); both
+        # the label and the number overdraw use it so their anchors stay identical.
+        parts += [
+            f"x={_CAPTION_MARGIN}",
+            f"y={_CAPTION_MARGIN}",
+            f"y_align={_CAPTION_Y_ALIGN}",
+            enable,
+        ]
+        return "drawtext=" + ":".join(parts)
+
+    # The full tag (box + off-white label) is drawn once. When an accent (the
+    # chapter number) is set, overdraw just that leading substring in a dim colour
+    # at the SAME anchor and with no box: monospace makes the digits land exactly
+    # on the label's, so only the number changes colour (the label is not redrawn).
+    filters = [_one(caption.text, _CAPTION_FONTCOLOR, box=True)]
+    if caption.accent:
+        filters.append(_one(caption.accent, _CAPTION_NUMBER_COLOR, box=False))
+    return ",".join(filters)
 
 
 #: Every audio segment is pinned to this exact format right before ``concat``.

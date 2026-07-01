@@ -226,9 +226,51 @@ def test_caption_is_top_left_chapter_tag():
     assert f"x={editor_mod._CAPTION_MARGIN}:y={editor_mod._CAPTION_MARGIN}" in fc
     assert f"fontsize={editor_mod._CAPTION_FONTSIZE}" in fc
     assert f"boxcolor={editor_mod._CAPTION_BOXCOLOR}" in fc
+    # Style pulled from the tunable constants (off-white label, wide-side padding).
+    assert f"fontcolor={editor_mod._CAPTION_FONTCOLOR}" in fc
+    assert f"boxborderw={editor_mod._CAPTION_BOXBORDERW}" in fc
     # Not the old bottom-centre placement.
     assert "x=(w-tw)/2" not in fc
     assert "y=h-th-60" not in fc
+
+
+def test_drawtext_number_accent_overdraws_dim_number():
+    # accent set -> TWO drawtexts: the boxed off-white tag, then just the number
+    # overdrawn in the muted colour (no box) at the same top-left anchor.
+    cap = editor_mod.Caption("01 · Power", 0.0, 8.0, accent="01")
+    s = editor_mod._drawtext_filter(cap, fontfile=None)
+    parts = s.split(",drawtext=")
+    assert len(parts) == 2
+    label_dt, number_dt = parts[0], "drawtext=" + parts[1]
+    # Full tag: boxed, off-white, wide-side padding, whole label text.
+    assert "text=01 · Power:" in label_dt
+    assert "box=1" in label_dt
+    assert f"fontcolor={editor_mod._CAPTION_FONTCOLOR}" in label_dt
+    assert f"boxborderw={editor_mod._CAPTION_BOXBORDERW}" in label_dt
+    # Overdraw: just the number, muted colour, NO box, same anchor & size.
+    assert "text=01:" in number_dt
+    assert f"fontcolor={editor_mod._CAPTION_NUMBER_COLOR}" in number_dt
+    assert "box=1" not in number_dt
+    assert f"x={editor_mod._CAPTION_MARGIN}:y={editor_mod._CAPTION_MARGIN}" in number_dt
+    # Constant box height across labels: y_align=font on BOTH drawtexts (sizes the
+    # box from font metrics, not the per-string glyph bbox), same anchor for both.
+    assert f"y_align={editor_mod._CAPTION_Y_ALIGN}" in label_dt
+    assert f"y_align={editor_mod._CAPTION_Y_ALIGN}" in number_dt
+
+
+def test_drawtext_single_colour_when_no_accent():
+    # No accent (e.g. a manual caption) -> a single drawtext, no muted overdraw.
+    s = editor_mod._drawtext_filter(editor_mod.Caption("Power", 0.0, 8.0), fontfile=None)
+    assert s.count("drawtext=") == 1
+    assert f"fontcolor={editor_mod._CAPTION_FONTCOLOR}" in s
+    assert editor_mod._CAPTION_NUMBER_COLOR not in s
+
+
+def test_chapter_captions_carry_number_accent():
+    plan = build_segment_plan(
+        [(20.0, "A"), (60.0, "B")], duration=140.0, pre=3.0, post=5.0, speed=8.0
+    )
+    assert {c.accent for seg in plan for c in seg.captions} == {"01", "02"}
 
 
 def test_filtergraph_draws_persistent_tag_on_lapse_segment():
