@@ -53,12 +53,14 @@ def test_plan_basic_windows_and_lapse_fill():
         (44.1, 52.1),
         (52.1, 60.0),
     ]
-    # Normal segments are 1x and keep their captions; lapse segments are 8x.
+    # Normal segments are 1x and carry their chapter tag (now number-prefixed);
+    # lapse segments are 8x. Windows don't merge, so one chapter per normal seg.
     normals = [s for s in plan if s.normal]
     assert all(s.speed == 1.0 for s in normals)
     assert all(s.speed == 8.0 for s in plan if not s.normal)
+    sep = editor_mod._CAPTION_NUMBER_SEP
     assert [c.text for s in normals for c in s.captions] == [
-        "power on", "chip lifted", "fault",
+        f"01{sep}power on", f"02{sep}chip lifted", f"03{sep}fault",
     ]
 
 
@@ -69,9 +71,11 @@ def test_plan_merges_overlapping_and_adjacent_windows():
     )
     assert _kinds(plan) == ["lapse", "normal", "lapse"]
     assert _spans(plan) == [(0.0, 7.0), (7.0, 18.0), (18.0, 30.0)]
-    # Both labels live in the single merged normal segment.
+    # Both labels live in the single merged normal segment, each as its own
+    # chapter over its sub-range; chapter 01 hands off to 02 at b's window start.
+    sep = editor_mod._CAPTION_NUMBER_SEP
     normal = plan[1]
-    assert [c.text for c in normal.captions] == ["a", "b"]
+    assert [c.text for c in normal.captions] == [f"01{sep}a", f"02{sep}b"]
 
 
 def test_plan_adjacent_windows_touch_and_merge():
@@ -112,6 +116,49 @@ def test_plan_unlabeled_marker_gets_no_caption():
     plan = build_segment_plan([(10.0, "")], duration=30.0)
     normal = [s for s in plan if s.normal][0]
     assert normal.captions == []
+
+
+def _caps(seg):
+    return [(c.text, round(c.start, 3), round(c.end, 3)) for c in seg.captions]
+
+
+def test_chapter_label_persists_across_lapse_segments_with_retimed_ranges():
+    # Approved worked example: labels A@20, B@60; pre 3, post 5, speed 8, dur 140.
+    # Segments: L[0,17] N[17,25] L[25,57] N[57,65] L[65,140].
+    plan = build_segment_plan(
+        [(20.0, "A"), (60.0, "B")], duration=140.0, pre=3.0, post=5.0, speed=8.0
+    )
+    sep = editor_mod._CAPTION_NUMBER_SEP
+    # Opening montage (before the first chapter's window start) has no label.
+    assert _caps(plan[0]) == []
+    # Chapter 01 shows during window A and PERSISTS through the A->B montage,
+    # its lapse range retimed by /speed: source 32s over [25,57] -> 4.000s local.
+    assert _caps(plan[1]) == [(f"01{sep}A", 0.0, 8.0)]
+    assert _caps(plan[2]) == [(f"01{sep}A", 0.0, 4.0)]
+    # It flips to chapter 02 at B's window start, which then rides the final
+    # montage to the end: source 75s over [65,140] -> 9.375s local.
+    assert _caps(plan[3]) == [(f"02{sep}B", 0.0, 8.0)]
+    assert _caps(plan[4]) == [(f"02{sep}B", 0.0, 9.375)]
+
+
+def test_chapter_numbering_is_contiguous_ordinal_skipping_unlabeled():
+    # An unlabeled marker between two labeled ones must NOT consume a number.
+    plan = build_segment_plan(
+        [(20.0, "A"), (40.0, ""), (60.0, "B")],
+        duration=140.0, pre=3.0, post=5.0, speed=8.0,
+    )
+    sep = editor_mod._CAPTION_NUMBER_SEP
+    tags = {c.text for seg in plan for c in seg.captions}
+    assert tags == {f"01{sep}A", f"02{sep}B"}
+
+
+def test_single_chapter_persists_from_its_window_to_the_end():
+    plan = build_segment_plan([(20.0, "only")], duration=100.0, pre=3.0, post=5.0, speed=8.0)
+    sep = editor_mod._CAPTION_NUMBER_SEP
+    # No label before the window; label on every segment from the window onward.
+    assert _caps(plan[0]) == []  # opening montage [0,17]
+    labeled = [s for s in plan[1:]]
+    assert all(len(s.captions) == 1 and s.captions[0].text == f"01{sep}only" for s in labeled)
 
 
 # --------------------------------------------------------------------------- #
@@ -182,6 +229,25 @@ def test_caption_is_top_left_chapter_tag():
     # Not the old bottom-centre placement.
     assert "x=(w-tw)/2" not in fc
     assert "y=h-th-60" not in fc
+
+
+def test_filtergraph_draws_persistent_tag_on_lapse_segment():
+    # The montage between two chapters is a lapse segment; it must still carry the
+    # (number-prefixed) chapter tag, so a drawtext sits right after the /speed setpts.
+    plan = build_segment_plan(
+        [(20.0, "A"), (60.0, "B")], duration=140.0, pre=3.0, post=5.0, speed=8.0
+    )
+    fc = build_filter_complex(plan, fontfile=None)
+    sep = editor_mod._CAPTION_NUMBER_SEP
+    assert "setpts=(PTS-STARTPTS)/8,drawtext=" in fc  # a lapse chain draws a caption
+    assert f"text=01{sep}A" in fc  # zero-padded number + middot separator + label
+
+
+def test_resolve_font_prefers_monospace():
+    # Windows candidate list leads with Consolas (present on Windows) for the
+    # engineering-terminal look; --font still overrides.
+    assert editor_mod._CAPTION_FONT_CANDIDATES_WINDOWS[0].lower().endswith("consola.ttf")
+    assert editor_mod._resolve_font("Z:\\nope.ttf") != "Z:\\nope.ttf"  # missing -> falls back
 
 
 def test_filtergraph_includes_escaped_fontfile_when_given():
@@ -354,7 +420,10 @@ def test_run_edit_builds_command_and_returns_output(tmp_path, monkeypatch):
     assert output == session.folder / "review.mp4"
     assert captured["cmd"][-1] == str(session.folder / "review.mp4")
     assert "-filter_complex_script" in captured["cmd"]
-    assert "drawtext=text=power on:expansion=none" in captured["graph"]
+    assert (
+        f"drawtext=text=01{editor_mod._CAPTION_NUMBER_SEP}power on:expansion=none"
+        in captured["graph"]
+    )
     # The temp filterscript is cleaned up afterwards (only review.mp4 remains).
     script_path = captured["cmd"][captured["cmd"].index("-filter_complex_script") + 1]
     assert not Path(script_path).exists()

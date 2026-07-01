@@ -144,20 +144,20 @@ def build_segment_plan(
         else:
             merged.append((ws, we, marks))
 
-    # Walk the timeline, filling gaps with timelapse segments.
+    # Walk the timeline, filling gaps with timelapse segments. Captions are
+    # attached in a second pass (see _attach_chapter_captions) because a chapter
+    # label now spans multiple segments, not just its own normal window.
     segments: list[Segment] = []
     cursor = 0.0
-    for ws, we, marks in merged:
+    for ws, we, _marks in merged:
         if ws > cursor:
             segments.append(_lapse(cursor, ws, speed))
-        captions = _captions_for(marks, ws, duration, pre, post)
-        segments.append(
-            Segment(start=ws, end=we, normal=True, speed=1.0, captions=captions)
-        )
+        segments.append(Segment(start=ws, end=we, normal=True, speed=1.0))
         cursor = we
     if cursor < duration:
         segments.append(_lapse(cursor, duration, speed))
 
+    _attach_chapter_captions(segments, events, duration, pre=pre)
     return segments
 
 
@@ -165,24 +165,68 @@ def _lapse(start: float, end: float, speed: float) -> Segment:
     return Segment(start=start, end=end, normal=False, speed=speed, captions=[])
 
 
-def _captions_for(
-    marks: list[tuple[float, str]],
-    window_start: float,
+@dataclass(frozen=True)
+class _Chapter:
+    """A labeled marker as a persistent chapter over a source-time range."""
+
+    number: int  # 1-based ordinal over labeled markers, in time order
+    label: str
+    src_start: float  # source seconds: this chapter's window start
+    src_end: float  # source seconds: next chapter's window start (or duration)
+
+
+def _chapters(events: list[tuple[float, str]], duration: float, pre: float) -> list[_Chapter]:
+    """Turn labeled markers into contiguous, non-overlapping chapters.
+
+    Each chapter is active in SOURCE time from its own window start
+    ``max(0, t - pre)`` until the next labeled marker's window start; the last
+    runs to ``duration``. Numbering is the 1-based ordinal over labeled markers
+    in time order (always contiguous — unlabeled markers are ignored, not counted).
+    """
+    labeled = sorted(
+        (
+            (min(max(t, 0.0), duration), label)
+            for t, label in events
+            if label.strip()
+        ),
+        key=lambda e: e[0],
+    )
+    starts = [max(0.0, t - pre) for t, _ in labeled]
+    chapters: list[_Chapter] = []
+    for i, (_t, label) in enumerate(labeled):
+        src_start = starts[i]
+        src_end = starts[i + 1] if i + 1 < len(starts) else duration
+        if src_end <= src_start:
+            continue  # zero-length (markers within `pre` of each other): later wins
+        chapters.append(_Chapter(i + 1, label.strip(), src_start, src_end))
+    return chapters
+
+
+def _attach_chapter_captions(
+    segments: list[Segment],
+    events: list[tuple[float, str]],
     duration: float,
+    *,
     pre: float,
-    post: float,
-) -> list[Caption]:
-    """Captions (segment-local time) for labeled markers in a normal window."""
-    captions: list[Caption] = []
-    for t, label in marks:
-        if not label:
-            continue
-        cs = max(0.0, t - pre)
-        ce = min(duration, t + post)
-        captions.append(
-            Caption(text=label, start=cs - window_start, end=ce - window_start)
-        )
-    return captions
+) -> None:
+    """Distribute each chapter's label across every segment its range overlaps.
+
+    A chapter active over source ``[a, b)`` is drawn on each overlapping segment
+    for the sub-range that falls inside it, converted to that segment's LOCAL
+    (post-retiming) output time via ``(x - seg.start) / seg.speed`` — so a label
+    persists across timelapse segments and stays in sync after the speed-up. The
+    number prefix is baked into the caption text (escaped later by drawtext).
+    """
+    for chapter in _chapters(events, duration, pre):
+        text = f"{chapter.number:02d}{_CAPTION_NUMBER_SEP}{chapter.label}"
+        for seg in segments:
+            lo = max(chapter.src_start, seg.start)
+            hi = min(chapter.src_end, seg.end)
+            if hi <= lo:
+                continue
+            local_start = (lo - seg.start) / seg.speed
+            local_end = (hi - seg.start) / seg.speed
+            seg.captions.append(Caption(text=text, start=local_start, end=local_end))
 
 
 def describe_plan(
@@ -255,16 +299,16 @@ def _escape_fontfile(fontfile: str) -> str:
     return str(fontfile).replace("\\", "/").replace(":", "\\\\:")
 
 
-# Chapter-tag overlay style. Each marker's label is burned top-left as a small,
-# unobtrusive tag on a semi-transparent box while its normal-speed window plays.
-# These are the knobs to tune after eyeballing a render; the timing (whole marker
-# window, hard cut via enable=between) and gap behaviour (no label in timelapse)
-# are deliberately unchanged.
-_CAPTION_FONTSIZE = 32
-_CAPTION_MARGIN = 48  # pixels from the top-left corner
+# Chapter-tag overlay style. Each marker's label persists top-left as a small,
+# monospace "engineering terminal" chapter tag, on a semi-transparent box, from
+# its window until the next chapter (drawn on timelapse segments too). All values
+# are knobs to tune after eyeballing a render; timing is a hard cut (no fade).
+_CAPTION_FONTSIZE = 32  # legible at 1080p (~3% of frame height)
+_CAPTION_MARGIN = 64  # pixels inset from the top-left corner
 _CAPTION_FONTCOLOR = "white"
-_CAPTION_BOXCOLOR = "black@0.5"  # semi-transparent backing box for legibility
-_CAPTION_BOXBORDERW = 10
+_CAPTION_BOXCOLOR = "black@0.62"  # semi-transparent backing box for legibility
+_CAPTION_BOXBORDERW = 22  # generous padding so it reads as a designed tag
+_CAPTION_NUMBER_SEP = " · "  # between the zero-padded chapter number and the label
 
 
 def _drawtext_filter(caption: Caption, fontfile: str | None) -> str:
@@ -323,10 +367,13 @@ def build_filter_complex(
         vfilters = [f"trim=start={s:.3f}:end={e:.3f}"]
         if seg.normal:
             vfilters.append("setpts=PTS-STARTPTS")
-            for cap in seg.captions:
-                vfilters.append(_drawtext_filter(cap, fontfile))
         else:
             vfilters.append(f"setpts=(PTS-STARTPTS)/{seg.speed:g}")
+        # Chapter tags are drawn on BOTH normal and timelapse segments so a label
+        # persists through the montage; each segment's captions carry enable-ranges
+        # already mapped to this segment's local (post-setpts) output time.
+        for cap in seg.captions:
+            vfilters.append(_drawtext_filter(cap, fontfile))
         chains.append(f"[0:v]{','.join(vfilters)}[v{k}]")
 
         if seg.normal and has_audio:
@@ -496,28 +543,36 @@ def find_capture(session_dir: Path) -> Path:
     )
 
 
+# Preferred caption fonts, monospace first for the engineering-terminal look.
+# Consolas ships with Windows; DejaVu Sans Mono / Menlo cover Linux / macOS. An
+# explicit --font still wins; if none of these exist we fall back to drawtext's
+# default so a render never dies on a missing font.
+_CAPTION_FONT_CANDIDATES_WINDOWS = [
+    r"C:\Windows\Fonts\consola.ttf",  # Consolas
+    r"C:\Windows\Fonts\consolab.ttf",  # Consolas Bold
+    r"C:\Windows\Fonts\cour.ttf",  # Courier New
+]
+_CAPTION_FONT_CANDIDATES_OTHER = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    "/System/Library/Fonts/Menlo.ttc",
+    "/Library/Fonts/Courier New.ttf",
+]
+
+
 def _resolve_font(font: str | None) -> str | None:
     """Pick a font file that actually exists, else None (drawtext default).
 
     The requested ``font`` is preferred but only if it exists; otherwise we fall
-    back to a known system font, and finally to no explicit fontfile so the
-    render never dies on a missing font.
+    back to a known monospace system font (Consolas on Windows), and finally to no
+    explicit fontfile so the render never dies on a missing font.
     """
     candidates: list[str] = []
     if font:
         candidates.append(font)
     if os.name == "nt":
-        candidates += [
-            r"C:\Windows\Fonts\arial.ttf",
-            r"C:\Windows\Fonts\segoeui.ttf",
-            r"C:\Windows\Fonts\calibri.ttf",
-        ]
+        candidates += _CAPTION_FONT_CANDIDATES_WINDOWS
     else:
-        candidates += [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/Library/Fonts/Arial.ttf",
-            "/System/Library/Fonts/Supplemental/Arial.ttf",
-        ]
+        candidates += _CAPTION_FONT_CANDIDATES_OTHER
     for candidate in candidates:
         if candidate and Path(candidate).exists():
             return candidate
