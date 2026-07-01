@@ -40,6 +40,15 @@ DEFAULT_PRE = 3.0
 DEFAULT_POST = 5.0
 DEFAULT_SPEED = 8.0
 
+# Speech-aware speed (opt-in via --vad). Speech spans + marker windows both count
+# as normal speed; these tune how speech is turned into normal-speed regions.
+DEFAULT_SPEECH_PAD_LEAD = 0.3   # seconds kept before each speech span
+DEFAULT_SPEECH_PAD_TRAIL = 0.5  # seconds kept after each speech span
+DEFAULT_MERGE_GAP = 1.5         # bridge normal regions closer than this (no strobing)
+DEFAULT_MIN_LAPSE = 5.0         # only timelapse gaps longer than this
+DEFAULT_VAD_THRESHOLD = 0.5     # silero speech probability threshold
+_VAD_SAMPLE_RATE = 16000        # silero-vad expects 16 kHz mono
+
 _INSTALL_HINT = (
     "ffmpeg was not found on PATH. The 'edit' command renders video with ffmpeg. "
     "Install it and try again — Windows: 'winget install Gyan.FFmpeg' (or "
@@ -49,6 +58,12 @@ _INSTALL_HINT = (
 _FFPROBE_HINT = (
     "ffprobe was not found on PATH. It ships alongside ffmpeg — installing ffmpeg "
     "provides it (see the ffmpeg install instructions)."
+)
+_VAD_INSTALL_HINT = (
+    "silero-vad is not installed. 'edit --vad' uses silero-vad (with torch) to "
+    "detect speech and drive normal-speed regions. Install it on the laptop with: "
+    "pip install 'benchcam[vad]' (or: pip install silero-vad). This pulls in torch "
+    "and is meant for the laptop, NOT the Raspberry Pi."
 )
 
 
@@ -111,6 +126,24 @@ def read_events(session_dir: Path) -> list[tuple[float, str]]:
 # Segment planning (pure)
 # --------------------------------------------------------------------------- #
 
+def _merge_intervals(
+    intervals: list[tuple[float, float]], gap: float
+) -> list[tuple[float, float]]:
+    """Sort and merge intervals, bridging any two separated by ``<= gap``.
+
+    ``gap=0`` is the plain overlap/adjacency merge (``next.start <= cur.end``);
+    a positive gap also absorbs short pauses between otherwise-separate regions.
+    """
+    merged: list[tuple[float, float]] = []
+    for start, end in sorted(intervals):
+        if merged and start <= merged[-1][1] + gap:
+            prev_start, prev_end = merged[-1]
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
 def build_segment_plan(
     events: list[tuple[float, str]],
     duration: float,
@@ -118,44 +151,58 @@ def build_segment_plan(
     pre: float = DEFAULT_PRE,
     post: float = DEFAULT_POST,
     speed: float = DEFAULT_SPEED,
+    speech_spans: list[tuple[float, float]] | None = None,
+    speech_pad_lead: float = 0.0,
+    speech_pad_trail: float = 0.0,
+    merge_gap: float = 0.0,
+    min_lapse: float = 0.0,
 ) -> list[Segment]:
     """Compute the ordered review segments for a video of ``duration`` seconds.
 
-    Pure and deterministic so it can be unit-tested without ffmpeg. Each marker
-    gets a normal-speed window ``[t-pre, t+post]`` (clamped to the video);
-    overlapping or adjacent windows merge; the gaps between windows are
-    timelapsed at ``speed``. With no markers the whole video is one timelapse.
+    Pure and deterministic so it can be unit-tested without ffmpeg or torch.
+    Normal-speed regions come from TWO sources, unioned together (design "B",
+    normal = speech OR marker):
+
+    - each marker forces a window ``[t-pre, t+post]`` (clamped to the video);
+    - each detected speech span (``speech_spans``, in source seconds) is padded by
+      ``speech_pad_lead``/``speech_pad_trail`` — pass ``None`` for marker-only.
+
+    Those intervals are merged (bridging pauses shorter than ``merge_gap``), gaps
+    shorter than ``min_lapse`` are absorbed into normal speed (no glitchy micro-
+    timelapses), and the remaining gaps are timelapsed at ``speed``. Captions are
+    attached afterwards from the markers (see ``_attach_chapter_captions``), so a
+    chapter label still persists across whatever segments result.
+
+    The defaults (``speech_spans=None``, ``merge_gap=0``, ``min_lapse=0``)
+    reproduce the marker-only tiling exactly, so plain ``edit`` is unchanged.
     """
     if duration <= 0:
         return []
 
-    # Clamp marker times into the video and build normal-speed windows.
-    windows: list[tuple[float, float, list[tuple[float, str]]]] = []
-    for raw_time, label in events:
+    intervals: list[tuple[float, float]] = []
+    # Marker-forced windows.
+    for raw_time, _label in events:
         t = min(max(raw_time, 0.0), duration)
         ws = max(0.0, t - pre)
         we = min(duration, t + post)
-        if we <= ws:
-            continue
-        windows.append((ws, we, [(t, label)]))
+        if we > ws:
+            intervals.append((ws, we))
+    # Speech-derived windows (padded, then clamped to the video).
+    for raw_start, raw_end in speech_spans or []:
+        s = max(0.0, min(max(raw_start, 0.0), duration) - speech_pad_lead)
+        e = min(duration, min(max(raw_end, 0.0), duration) + speech_pad_trail)
+        if e > s:
+            intervals.append((s, e))
 
-    windows.sort(key=lambda w: w[0])
+    # (a) union, bridging short pauses; (b) absorb gaps too short to timelapse.
+    blocks = _merge_intervals(_merge_intervals(intervals, merge_gap), min_lapse)
 
-    # Merge overlapping/adjacent windows (next.start <= current.end).
-    merged: list[tuple[float, float, list[tuple[float, str]]]] = []
-    for ws, we, marks in windows:
-        if merged and ws <= merged[-1][1]:
-            cs, ce, cmarks = merged[-1]
-            merged[-1] = (cs, max(ce, we), cmarks + marks)
-        else:
-            merged.append((ws, we, marks))
-
-    # Walk the timeline, filling gaps with timelapse segments. Captions are
-    # attached in a second pass (see _attach_chapter_captions) because a chapter
-    # label now spans multiple segments, not just its own normal window.
+    # (c) Walk the timeline, filling the remaining gaps with timelapse segments.
+    # Captions are attached in a second pass because a chapter label spans
+    # multiple segments, not just its own normal window.
     segments: list[Segment] = []
     cursor = 0.0
-    for ws, we, _marks in merged:
+    for ws, we in blocks:
         if ws > cursor:
             segments.append(_lapse(cursor, ws, speed))
         segments.append(Segment(start=ws, end=we, normal=True, speed=1.0))
@@ -523,6 +570,74 @@ def run_ffmpeg_command(cmd: list[str]) -> subprocess.CompletedProcess:
 
 
 # --------------------------------------------------------------------------- #
+# Speech detection (silero-vad; optional [vad] extra, lazy import, mockable)
+# --------------------------------------------------------------------------- #
+
+def _import_silero():
+    """Import torch + silero-vad lazily, mapping a missing dep to a clear error.
+
+    Wrapped in its own function so tests can monkeypatch it without torch/silero
+    installed (the stdlib-only core and the Raspberry Pi never import either).
+    """
+    try:
+        import torch  # noqa: F401
+        from silero_vad import get_speech_timestamps, load_silero_vad
+    except ImportError as exc:  # pragma: no cover - exercised via monkeypatch
+        raise EditError(_VAD_INSTALL_HINT) from exc
+    return torch, load_silero_vad, get_speech_timestamps
+
+
+def _decode_audio_mono_16k(capture: Path | str, ffmpeg: str) -> bytes:
+    """Decode the capture's audio to raw 16 kHz mono float32 PCM via ffmpeg.
+
+    A read-only decode of the SOURCE audio (like probe_duration) — it does not
+    touch the review's audio filter path. Using ffmpeg (already required) avoids
+    torchaudio's flaky backends on Windows.
+    """
+    cmd = [
+        ffmpeg, "-v", "error", "-i", str(capture),
+        "-ac", "1", "-ar", str(_VAD_SAMPLE_RATE), "-f", "f32le", "-",
+    ]
+    result = subprocess.run(cmd, capture_output=True)
+    if result.returncode != 0:
+        detail = (result.stderr or b"").decode("utf-8", "replace").strip()
+        raise EditError(f"ffmpeg could not decode audio for VAD: {detail}")
+    return result.stdout
+
+
+def detect_speech_spans(
+    capture: Path | str,
+    *,
+    threshold: float = DEFAULT_VAD_THRESHOLD,
+    ffmpeg: str = "ffmpeg",
+    out: Callable[[str], object] = print,
+) -> list[tuple[float, float]]:
+    """Return speech spans ``[(start, end), ...]`` in SOURCE seconds via silero-vad.
+
+    Pure data out (seconds), so ``build_segment_plan`` stays deterministic and
+    torch-free. The torch/silero part goes through ``_import_silero`` and the
+    audio read through ffmpeg, both of which tests monkeypatch.
+    """
+    import numpy as np
+
+    torch, load_silero_vad, get_speech_timestamps = _import_silero()
+    pcm = _decode_audio_mono_16k(capture, ffmpeg)
+    audio = np.frombuffer(pcm, dtype=np.float32).copy()  # copy: frombuffer is read-only
+    wav = torch.from_numpy(audio)
+    model = load_silero_vad()
+    stamps = get_speech_timestamps(
+        wav,
+        model,
+        sampling_rate=_VAD_SAMPLE_RATE,
+        threshold=threshold,
+        return_seconds=True,
+    )
+    spans = [(float(s["start"]), float(s["end"])) for s in stamps]
+    out(f"VAD: {len(spans)} speech span(s) detected.")
+    return spans
+
+
+# --------------------------------------------------------------------------- #
 # Session / capture resolution
 # --------------------------------------------------------------------------- #
 
@@ -625,11 +740,22 @@ def run_edit(
     post: float = DEFAULT_POST,
     speed: float = DEFAULT_SPEED,
     font: str | None = None,
+    vad: bool = False,
+    speech_pad_lead: float = DEFAULT_SPEECH_PAD_LEAD,
+    speech_pad_trail: float = DEFAULT_SPEECH_PAD_TRAIL,
+    merge_gap: float = DEFAULT_MERGE_GAP,
+    min_lapse: float = DEFAULT_MIN_LAPSE,
+    vad_threshold: float = DEFAULT_VAD_THRESHOLD,
     ffmpeg: str | None = None,
     ffprobe: str | None = None,
     out: Callable[[str], object] = print,
 ) -> Path:
-    """Render ``review.mp4`` for ``session_dir`` and return its path."""
+    """Render ``review.mp4`` for ``session_dir`` and return its path.
+
+    With ``vad=True`` (opt-in), detected speech spans also drive normal speed
+    (design "B": normal = speech OR marker). If silero-vad isn't installed or the
+    capture has no audio, this falls back to marker-only speed with a note.
+    """
     session_dir = Path(session_dir)
     if pre < 0 or post < 0:
         raise EditError("--pre and --post must be >= 0 seconds.")
@@ -650,7 +776,37 @@ def run_edit(
     has_audio = probe_has_audio(capture, ffprobe=ffprobe)
 
     events = read_events(session_dir)
-    plan = build_segment_plan(events, duration, pre=pre, post=post, speed=speed)
+
+    # Opt-in speech-aware speed. On any problem, fall back to marker-only so a
+    # plain (or degraded) edit still renders — never crash the whole command.
+    speech_spans: list[tuple[float, float]] | None = None
+    if vad:
+        if not has_audio:
+            out("--vad: capture has no audio track — using marker-only speed.")
+        else:
+            try:
+                speech_spans = detect_speech_spans(
+                    capture, threshold=vad_threshold, ffmpeg=ffmpeg, out=out
+                )
+            except EditError as exc:
+                out(f"--vad unavailable ({exc}); using marker-only speed.")
+                speech_spans = None
+
+    # merge_gap/min_lapse only shape speech-derived regions; with marker-only they
+    # stay 0 so plain 'edit' tiling is byte-for-byte unchanged.
+    use_speech = speech_spans is not None
+    plan = build_segment_plan(
+        events,
+        duration,
+        pre=pre,
+        post=post,
+        speed=speed,
+        speech_spans=speech_spans,
+        speech_pad_lead=speech_pad_lead,
+        speech_pad_trail=speech_pad_trail,
+        merge_gap=merge_gap if use_speech else 0.0,
+        min_lapse=min_lapse if use_speech else 0.0,
+    )
 
     out(f"Editing {capture.name} ({duration:.1f}s, audio={'yes' if has_audio else 'no'}).")
     out(describe_plan(plan, speed=speed, marker_count=len(events)))

@@ -162,6 +162,126 @@ def test_single_chapter_persists_from_its_window_to_the_end():
 
 
 # --------------------------------------------------------------------------- #
+# VAD-driven speech-aware speed (pure plan; torch/silero not needed)
+# --------------------------------------------------------------------------- #
+
+def test_marker_only_is_backward_compatible_noop():
+    # speech_spans=None + merge_gap/min_lapse=0 must equal the old marker-only plan.
+    events = [(18.8, "a"), (34.9, "b"), (47.1, "c")]
+    base = build_segment_plan(events, 60.0, pre=3, post=5, speed=8)
+    same = build_segment_plan(
+        events, 60.0, pre=3, post=5, speed=8,
+        speech_spans=None, merge_gap=0.0, min_lapse=0.0,
+    )
+    assert _spans(base) == _spans(same) and _kinds(base) == _kinds(same)
+
+
+def test_speech_span_creates_a_normal_region():
+    plan = build_segment_plan([], 60.0, speed=8, speech_spans=[(10.0, 15.0)])
+    assert _kinds(plan) == ["lapse", "normal", "lapse"]
+    assert _spans(plan) == [(0.0, 10.0), (10.0, 15.0), (15.0, 60.0)]
+
+
+def test_speech_and_marker_windows_union():
+    # marker@5 -> window [2,10]; speech (30,35). Both are normal (design B).
+    plan = build_segment_plan(
+        [(5.0, "A")], 60.0, pre=3, post=5, speed=8, speech_spans=[(30.0, 35.0)]
+    )
+    assert _kinds(plan) == ["lapse", "normal", "lapse", "normal", "lapse"]
+    assert _spans(plan) == [(0.0, 2.0), (2.0, 10.0), (10.0, 30.0), (30.0, 35.0), (35.0, 60.0)]
+
+
+def test_speech_pad_lead_and_trail_extend_the_span():
+    plan = build_segment_plan(
+        [], 60.0, speed=8, speech_spans=[(10.0, 15.0)],
+        speech_pad_lead=0.3, speech_pad_trail=0.5,
+    )
+    assert _spans(plan) == [(0.0, 9.7), (9.7, 15.5), (15.5, 60.0)]
+
+
+def test_merge_gap_bridges_short_pause_between_speech():
+    spans = [(10.0, 12.0), (13.0, 15.0)]  # 1s pause between
+    # merge_gap 1.5 bridges the pause into one normal block; 0 keeps them split.
+    bridged = build_segment_plan([], 60.0, speed=8, speech_spans=spans, merge_gap=1.5)
+    split = build_segment_plan([], 60.0, speed=8, speech_spans=spans, merge_gap=0.0)
+    assert _spans(bridged) == [(0.0, 10.0), (10.0, 15.0), (15.0, 60.0)]
+    assert _kinds(split) == ["lapse", "normal", "lapse", "normal", "lapse"]
+
+
+def test_min_lapse_absorbs_short_gap_into_normal():
+    # Two normal blocks 3s apart; min_lapse 5 absorbs the gap (no micro-lapse).
+    spans = [(10.0, 15.0), (18.0, 22.0)]
+    absorbed = build_segment_plan([], 60.0, speed=8, speech_spans=spans, min_lapse=5.0)
+    lapsed = build_segment_plan([], 60.0, speed=8, speech_spans=spans, min_lapse=0.0)
+    assert _spans(absorbed) == [(0.0, 10.0), (10.0, 22.0), (22.0, 60.0)]
+    assert _kinds(lapsed) == ["lapse", "normal", "lapse", "normal", "lapse"]
+
+
+def test_chapter_tag_persists_across_vad_normal_lapse_normal():
+    # One labeled marker (chapter 01) plus a later speech-derived normal region.
+    # Chapter 01 is active [2, 60) and must appear on the normal window, the
+    # montage lapse, AND the speech-driven normal region after it — with correct
+    # (x - seg.start)/speed retiming on the lapse.
+    plan = build_segment_plan(
+        [(5.0, "Power On")], 60.0, pre=3, post=5, speed=8,
+        speech_spans=[(30.0, 35.0)],
+    )
+    # segments: L[0,2] N[2,10] L[10,30] N[30,35] L[35,60]
+    assert _kinds(plan) == ["lapse", "normal", "lapse", "normal", "lapse"]
+    sep = editor_mod._CAPTION_NUMBER_SEP
+    tag = f"01{sep}Power On"
+
+    def one(seg):
+        assert len(seg.captions) == 1 and seg.captions[0].text == tag
+        assert seg.captions[0].accent == "01"
+        return round(seg.captions[0].start, 3), round(seg.captions[0].end, 3)
+
+    assert plan[0].captions == []          # opening montage before the chapter
+    assert one(plan[1]) == (0.0, 8.0)      # normal window [2,10]
+    assert one(plan[2]) == (0.0, 2.5)      # lapse [10,30] /8 -> (30-10)/8 = 2.5
+    assert one(plan[3]) == (0.0, 5.0)      # speech-driven normal [30,35]
+    assert one(plan[4]) == (0.0, 3.125)    # final lapse [35,60] /8 -> 25/8 = 3.125
+
+
+# --------------------------------------------------------------------------- #
+# detect_speech_spans (silero + ffmpeg mocked; no torch/silero installed)
+# --------------------------------------------------------------------------- #
+
+def test_detect_speech_spans_maps_stamps_to_seconds(monkeypatch):
+    import struct
+
+    class _FakeTorch:
+        @staticmethod
+        def from_numpy(a):
+            return a  # identity; the fake model ignores the tensor anyway
+
+    def fake_import():
+        load = lambda: "MODEL"  # noqa: E731
+        def get_ts(wav, model, **kw):
+            assert model == "MODEL" and kw["sampling_rate"] == 16000
+            return [{"start": 1.0, "end": 2.0}, {"start": 3.5, "end": 4.25}]
+        return _FakeTorch, load, get_ts
+
+    monkeypatch.setattr(editor_mod, "_import_silero", fake_import)
+    # Four float32 samples of silence; the fake VAD ignores the content.
+    monkeypatch.setattr(
+        editor_mod, "_decode_audio_mono_16k", lambda *a, **k: struct.pack("<4f", 0, 0, 0, 0)
+    )
+    spans = editor_mod.detect_speech_spans("cap.mkv", out=lambda _m: None)
+    assert spans == [(1.0, 2.0), (3.5, 4.25)]
+
+
+def test_detect_speech_spans_missing_silero_raises(monkeypatch):
+    def boom():
+        raise EditError(editor_mod._VAD_INSTALL_HINT)
+
+    monkeypatch.setattr(editor_mod, "_import_silero", boom)
+    with pytest.raises(EditError) as exc:
+        editor_mod.detect_speech_spans("cap.mkv", out=lambda _m: None)
+    assert "vad" in str(exc.value).lower()
+
+
+# --------------------------------------------------------------------------- #
 # drawtext / fontfile escaping (the Windows fix)
 # --------------------------------------------------------------------------- #
 
@@ -524,3 +644,86 @@ def test_run_edit_propagates_ffmpeg_failure(tmp_path, monkeypatch):
     with pytest.raises(EditError) as exc:
         editor_mod.run_edit(session.folder, out=lambda _m: None)
     assert "ffmpeg failed" in str(exc.value).lower()
+
+
+def _vad_session(tmp_path, monkeypatch, *, has_audio=True):
+    from benchcam import session as session_mod
+
+    session = session_mod.create_session(root=tmp_path / "sessions")
+    (session.folder / "capture.mp4").write_bytes(b"video")
+    session_mod.start_session(session)
+    session_mod.add_marker(session, "Power On")
+    monkeypatch.setattr(editor_mod.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(editor_mod, "probe_duration", lambda *a, **k: 60.0)
+    monkeypatch.setattr(editor_mod, "probe_has_audio", lambda *a, **k: has_audio)
+    graph = {}
+
+    def fake_run(cmd):
+        script = cmd[cmd.index("-filter_complex_script") + 1]
+        graph["fc"] = Path(script).read_text(encoding="utf-8")
+        return mock.Mock(returncode=0, stderr="")
+
+    monkeypatch.setattr(editor_mod, "run_ffmpeg_command", fake_run)
+    return session, graph
+
+
+def test_run_edit_vad_uses_detected_speech_as_normal(tmp_path, monkeypatch):
+    session, graph = _vad_session(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        editor_mod, "detect_speech_spans", lambda *a, **k: [(30.0, 35.0)]
+    )
+    editor_mod.run_edit(session.folder, vad=True, out=lambda _m: None)
+    # The speech region [30,35] became a normal-speed segment (its own trim).
+    assert "trim=start=29.700:end=35.500" in graph["fc"]  # padded speech span
+
+
+def test_run_edit_without_vad_ignores_speech(tmp_path, monkeypatch):
+    session, graph = _vad_session(tmp_path, monkeypatch)
+    called = {"n": 0}
+
+    def spy(*a, **k):
+        called["n"] += 1
+        return [(30.0, 35.0)]
+
+    monkeypatch.setattr(editor_mod, "detect_speech_spans", spy)
+    editor_mod.run_edit(session.folder, vad=False, out=lambda _m: None)
+    assert called["n"] == 0  # VAD is opt-in; never invoked
+    assert "trim=start=29.700:end=35.500" not in graph["fc"]
+
+
+def test_run_edit_vad_falls_back_without_audio(tmp_path, monkeypatch):
+    session, graph = _vad_session(tmp_path, monkeypatch, has_audio=False)
+
+    def boom(*a, **k):
+        raise AssertionError("detect_speech_spans must not be called without audio")
+
+    monkeypatch.setattr(editor_mod, "detect_speech_spans", boom)
+    messages: list[str] = []
+    editor_mod.run_edit(session.folder, vad=True, out=messages.append)
+    assert any("no audio" in m.lower() for m in messages)
+
+
+def test_run_edit_vad_falls_back_when_silero_missing(tmp_path, monkeypatch):
+    session, graph = _vad_session(tmp_path, monkeypatch)
+
+    def missing(*a, **k):
+        raise EditError(editor_mod._VAD_INSTALL_HINT)
+
+    monkeypatch.setattr(editor_mod, "detect_speech_spans", missing)
+    messages: list[str] = []
+    editor_mod.run_edit(session.folder, vad=True, out=messages.append)
+    # Rendered anyway (marker-only), with a note instead of a crash.
+    assert any("marker-only" in m.lower() for m in messages)
+    assert "trim=start=29.700:end=35.500" not in graph["fc"]
+
+
+def test_cli_edit_vad_dispatches(tmp_path, monkeypatch):
+    from benchcam.cli import main
+
+    session, _graph = _vad_session(tmp_path, monkeypatch)
+    monkeypatch.setattr(editor_mod, "detect_speech_spans", lambda *a, **k: [(30.0, 35.0)])
+    code = main(
+        ["edit", "--sessions-root", str(tmp_path / "sessions"),
+         "--session", str(session.folder), "--vad"]
+    )
+    assert code == 0

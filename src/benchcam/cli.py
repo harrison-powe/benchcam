@@ -157,6 +157,47 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to a .ttf font for captions (default: a system font).",
     )
+    p_edit.add_argument(
+        "--vad",
+        action="store_true",
+        help="Speech-aware speed: also play detected speech at normal speed "
+        "(silero-vad, needs the [vad] extra). Opt-in; falls back to marker-only "
+        "if unavailable or the capture has no audio.",
+    )
+    p_edit.add_argument(
+        "--speech-pad-lead",
+        type=float,
+        default=editor_mod.DEFAULT_SPEECH_PAD_LEAD,
+        help="Seconds kept before each speech span so the first syllable isn't "
+        "clipped (default: 0.3). --vad only.",
+    )
+    p_edit.add_argument(
+        "--speech-pad-trail",
+        type=float,
+        default=editor_mod.DEFAULT_SPEECH_PAD_TRAIL,
+        help="Seconds kept after each speech span (default: 0.5). --vad only.",
+    )
+    p_edit.add_argument(
+        "--merge-gap",
+        type=float,
+        default=editor_mod.DEFAULT_MERGE_GAP,
+        help="Merge normal-speed regions separated by less than this so short "
+        "pauses don't strobe the speed (default: 1.5s). --vad only.",
+    )
+    p_edit.add_argument(
+        "--min-lapse",
+        type=float,
+        default=editor_mod.DEFAULT_MIN_LAPSE,
+        help="Only timelapse gaps longer than this; shorter gaps stay normal "
+        "speed (default: 5s), avoiding glitchy micro-timelapses. --vad only.",
+    )
+    p_edit.add_argument(
+        "--vad-threshold",
+        type=float,
+        default=editor_mod.DEFAULT_VAD_THRESHOLD,
+        help="Silero speech probability threshold, 0-1; higher = stricter "
+        "(default: 0.5). --vad only.",
+    )
     p_edit.set_defaults(func=cmd_edit)
 
     # transcribe
@@ -375,6 +416,12 @@ def cmd_edit(args: argparse.Namespace) -> int:
         post=args.post,
         speed=args.speed,
         font=args.font,
+        vad=args.vad,
+        speech_pad_lead=args.speech_pad_lead,
+        speech_pad_trail=args.speech_pad_trail,
+        merge_gap=args.merge_gap,
+        min_lapse=args.min_lapse,
+        vad_threshold=args.vad_threshold,
     )
     print(f"Wrote {output}")
     return 0

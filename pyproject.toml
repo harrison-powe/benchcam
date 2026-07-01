@@ -27,6 +27,10 @@ transcribe = ["openai-whisper>=20231117"]
 # benchcam/label.py, so 'pip install benchcam' (without [label]) never pulls in
 # the anthropic SDK. Meant for the laptop; needs $ANTHROPIC_API_KEY at runtime.
 label = ["anthropic>=0.40"]
+# Speech-aware speed for 'benchcam edit --vad' only. Imported lazily inside
+# benchcam/editor.py, so 'pip install benchcam' (without [vad]) never pulls in
+# silero-vad or torch. Meant for the laptop (torch), NOT the Raspberry Pi.
+vad = ["silero-vad>=5.1"]
 dev = ["pytest>=7"]
 
 [project.scripts]
