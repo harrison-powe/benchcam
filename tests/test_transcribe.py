@@ -1,9 +1,11 @@
-"""Tests for Whisper-based marker auto-labeling.
+"""Tests for Whisper-based marker narration capture.
 
-The transcript->marker join (label_for_marker / plan_labels) is pure and is the
-core of these tests. Whisper itself is always mocked — no real model is loaded
-and no audio is decoded. Orchestration (run_transcribe) is tested with
+The transcript->marker join (narration_for_marker / plan_narrations) is pure and
+is the core of these tests. Whisper itself is always mocked — no real model is
+loaded and no audio is decoded. Orchestration (run_transcribe) is tested with
 find_capture/probe_has_audio/ffmpeg lookup and transcribe_audio monkeypatched.
+Transcription now writes each marker's raw ``narration`` column (not ``label``);
+the terse ``label`` is produced separately by ``benchcam label``.
 """
 
 from __future__ import annotations
@@ -17,8 +19,8 @@ from benchcam.transcribe import (
     ENV_MODEL,
     TranscribeError,
     TranscriptSegment,
-    label_for_marker,
-    plan_labels,
+    narration_for_marker,
+    plan_narrations,
     resolve_model,
     run_transcribe,
 )
@@ -40,103 +42,106 @@ TRANSCRIPT = [
 
 
 # --------------------------------------------------------------------------- #
-# label_for_marker (window join)
+# narration_for_marker (window join)
 # --------------------------------------------------------------------------- #
 
 def test_label_picks_segment_inside_window():
     # marker at 10s, window 5 -> [5, 15] catches only "power on" (9-11).
-    assert label_for_marker(10.0, TRANSCRIPT, window=5.0) == "power on"
+    assert narration_for_marker(10.0, TRANSCRIPT, window=5.0) == "power on"
 
 
 def test_label_joins_multiple_segments_in_order():
     # marker at 12.5, window 3 -> [9.5, 15.5] overlaps both 9-11 and 14-16.
     local = [seg(9.0, 11.0, "power on"), seg(14.0, 16.0, "chip lifted")]
-    assert label_for_marker(12.5, local, window=3.0) == "power on chip lifted"
+    assert narration_for_marker(12.5, local, window=3.0) == "power on chip lifted"
 
 
 def test_label_empty_when_nothing_in_window():
     # marker at 33s, window 2 -> [31, 35], gap between 24-26 and 40-42.
-    assert label_for_marker(33.0, TRANSCRIPT, window=2.0) == ""
+    assert narration_for_marker(33.0, TRANSCRIPT, window=2.0) == ""
 
 
 def test_label_window_edge_is_inclusive_on_segment_end():
     # marker at 26s, window 0 -> [26,26]; segment 24-26 ends exactly at 26.
-    assert label_for_marker(26.0, TRANSCRIPT, window=0.0) == "chip lifted"
+    assert narration_for_marker(26.0, TRANSCRIPT, window=0.0) == "chip lifted"
 
 
 def test_label_window_edge_is_inclusive_on_segment_start():
     # marker at 9s, window 0 -> [9,9]; segment 9-11 starts exactly at 9.
-    assert label_for_marker(9.0, TRANSCRIPT, window=0.0) == "power on"
+    assert narration_for_marker(9.0, TRANSCRIPT, window=0.0) == "power on"
 
 
 def test_label_just_outside_window_excluded():
     # marker at 8.9, window 0 -> [8.9,8.9]; segment starts at 9.0 -> excluded.
-    assert label_for_marker(8.9, TRANSCRIPT, window=0.0) == ""
+    assert narration_for_marker(8.9, TRANSCRIPT, window=0.0) == ""
 
 
 def test_label_emitted_in_chronological_order_regardless_of_input_order():
     unordered = [seg(14.0, 16.0, "second"), seg(9.0, 11.0, "first")]
-    assert label_for_marker(12.5, unordered, window=3.0) == "first second"
+    assert narration_for_marker(12.5, unordered, window=3.0) == "first second"
 
 
 # --------------------------------------------------------------------------- #
-# plan_labels (which markers get labeled)
+# plan_narrations (which markers get narration)
 # --------------------------------------------------------------------------- #
 
 def _markers(*rows):
+    # Each row is (elapsed, narration, source). Transcription skips on existing
+    # NARRATION now, so that is the column the plan tests vary.
     out = []
-    for i, (elapsed, label, source) in enumerate(rows, start=1):
+    for i, (elapsed, narration, source) in enumerate(rows, start=1):
         out.append(
             {
                 "marker_index": str(i),
                 "elapsed_seconds": f"{elapsed:.3f}",
                 "wall_time": "2026-06-22T12:00:00",
                 "source": source,
-                "label": label,
+                "label": "",
+                "narration": narration,
             }
         )
     return out
 
 
-def test_plan_fills_only_empty_labels():
+def test_plan_fills_only_empty_narration():
     markers = _markers(
-        (10.0, "", "manual"),  # empty -> gets "power on"
-        (15.0, "typed it myself", "manual"),  # has label -> skipped
+        (10.0, "", "manual"),  # empty narration -> gets "power on"
+        (15.0, "already captured", "manual"),  # has narration -> skipped
     )
-    plan = plan_labels(markers, TRANSCRIPT, window=5.0)
-    assert [(a.marker_index, a.label) for a in plan] == [(1, "power on")]
+    plan = plan_narrations(markers, TRANSCRIPT, window=5.0)
+    assert [(a.marker_index, a.narration) for a in plan] == [(1, "power on")]
 
 
-def test_plan_overwrite_replaces_existing_labels():
-    markers = _markers((25.0, "typed it myself", "manual"))
-    plan = plan_labels(markers, TRANSCRIPT, window=5.0, overwrite=True)
-    assert [(a.marker_index, a.label) for a in plan] == [(1, "chip lifted")]
+def test_plan_overwrite_replaces_existing_narration():
+    markers = _markers((25.0, "stale narration", "manual"))
+    plan = plan_narrations(markers, TRANSCRIPT, window=5.0, overwrite=True)
+    assert [(a.marker_index, a.narration) for a in plan] == [(1, "chip lifted")]
 
 
 def test_plan_skips_markers_with_no_transcript_text():
-    # marker at 33s has nothing in window -> no assignment, not an empty label.
+    # marker at 33s has nothing in window -> no assignment, not empty narration.
     markers = _markers((33.0, "", "manual"))
-    assert plan_labels(markers, TRANSCRIPT, window=2.0) == []
+    assert plan_narrations(markers, TRANSCRIPT, window=2.0) == []
 
 
 def test_plan_tags_source_preserving_origin():
     markers = _markers((10.0, "", "external"))
-    plan = plan_labels(markers, TRANSCRIPT, window=5.0)
+    plan = plan_narrations(markers, TRANSCRIPT, window=5.0)
     assert plan[0].source == "external+transcribed"
 
 
 def test_plan_source_tag_is_idempotent():
     markers = _markers((10.0, "old", "manual+transcribed"))
-    plan = plan_labels(markers, TRANSCRIPT, window=5.0, overwrite=True)
+    plan = plan_narrations(markers, TRANSCRIPT, window=5.0, overwrite=True)
     assert plan[0].source == "manual+transcribed"
 
 
 def test_plan_ignores_unparseable_rows():
     markers = [
-        {"marker_index": "x", "elapsed_seconds": "10", "label": "", "source": "m"},
-        {"marker_index": "1", "elapsed_seconds": "bad", "label": "", "source": "m"},
+        {"marker_index": "x", "elapsed_seconds": "10", "narration": "", "source": "m"},
+        {"marker_index": "1", "elapsed_seconds": "bad", "narration": "", "source": "m"},
     ]
-    assert plan_labels(markers, TRANSCRIPT, window=5.0) == []
+    assert plan_narrations(markers, TRANSCRIPT, window=5.0) == []
 
 
 # --------------------------------------------------------------------------- #
@@ -194,7 +199,7 @@ def _patch_environment(monkeypatch, segments, *, has_audio=True):
     )
 
 
-def test_run_transcribe_labels_markers_and_writes_csv(tmp_path, monkeypatch):
+def test_run_transcribe_writes_narration_not_label(tmp_path, monkeypatch):
     from benchcam import session as session_mod
 
     session = _session_with_markers(tmp_path)
@@ -209,26 +214,28 @@ def test_run_transcribe_labels_markers_and_writes_csv(tmp_path, monkeypatch):
     messages: list[str] = []
     plan = run_transcribe(session.folder, window=5.0, out=messages.append)
 
-    assert [(a.marker_index, a.label) for a in plan] == [(1, "power on")]
+    assert [(a.marker_index, a.narration) for a in plan] == [(1, "power on")]
     written = read_markers(session.markers_file)
-    assert written[0]["label"] == "power on"
+    assert written[0]["narration"] == "power on"
+    assert written[0]["label"] == ""  # transcription never touches the terse label
     assert written[0]["source"] == "manual+transcribed"
 
 
-def test_run_transcribe_keeps_manual_label_without_overwrite(tmp_path, monkeypatch):
+def test_run_transcribe_keeps_existing_narration_without_overwrite(tmp_path, monkeypatch):
     from benchcam import session as session_mod
 
     session = _session_with_markers(tmp_path)
-    session_mod.add_marker(session, "operator note", source="manual")
+    session_mod.add_marker(session, "", source="manual")
     rows = read_markers(session.markers_file)
     rows[0]["elapsed_seconds"] = "10.000"
+    rows[0]["narration"] = "already captured"
     _rewrite(session.markers_file, rows)
 
     _patch_environment(monkeypatch, [seg(9.0, 11.0, "power on")])
 
     plan = run_transcribe(session.folder, window=5.0, out=lambda _m: None)
     assert plan == []
-    assert read_markers(session.markers_file)[0]["label"] == "operator note"
+    assert read_markers(session.markers_file)[0]["narration"] == "already captured"
 
 
 def test_run_transcribe_no_audio_skips(tmp_path, monkeypatch):

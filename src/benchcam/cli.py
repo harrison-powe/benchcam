@@ -7,7 +7,8 @@ Commands:
     benchcam live           interactive single-keypress marking shell
     benchcam end            stop recording and close the active session
     benchcam edit           render a marker-aware review.mp4 for a session
-    benchcam transcribe     auto-label markers from spoken narration (Whisper)
+    benchcam transcribe     capture spoken narration near each marker (Whisper)
+    benchcam label          summarize narration into terse labels (Claude API)
     benchcam dashboard      local web UI: start/mark/stop/review in a browser
     benchcam fetch          (laptop) pull a session from the Pi over scp and open it
 
@@ -28,11 +29,13 @@ from . import __version__
 from . import dashboard as dashboard_mod
 from . import editor as editor_mod
 from . import keypress
+from . import label as label_mod
 from . import live as live_mod
 from . import session as session_mod
 from . import transcribe as transcribe_mod
 from .dashboard import DashboardError
 from .editor import EditError
+from .label import LabelError
 from .recorders import get_recorder
 from .recorders.base import RecorderError
 from .session import SessionError
@@ -188,6 +191,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="Replace existing marker labels too (default: only fill empty ones).",
     )
     p_tr.set_defaults(func=cmd_transcribe)
+
+    # label
+    p_label = sub.add_parser(
+        "label",
+        help="Summarize each marker's narration into a terse technical label "
+        "using the Claude API (runs on the laptop; needs the [label] extra and "
+        "$ANTHROPIC_API_KEY).",
+    )
+    _add_root_arg(p_label)
+    p_label.add_argument(
+        "--session",
+        default=None,
+        help="Session id or folder path to label (default: newest session).",
+    )
+    p_label.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "Claude model to use "
+            f"(default: $BENCHCAM_LABEL_MODEL or {label_mod.DEFAULT_MODEL})."
+        ),
+    )
+    p_label.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace existing labels too (default: only fill empty ones, "
+        "preserving hand-typed labels).",
+    )
+    p_label.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Call the API and print proposed labels without writing markers.csv.",
+    )
+    p_label.set_defaults(func=cmd_label)
 
     # dashboard
     p_dash = sub.add_parser(
@@ -348,6 +385,19 @@ def cmd_transcribe(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_label(args: argparse.Namespace) -> int:
+    session_dir = editor_mod.resolve_session_dir(
+        Path(args.sessions_root), args.session
+    )
+    label_mod.run_label(
+        session_dir,
+        model=args.model,
+        overwrite=args.overwrite,
+        dry_run=args.dry_run,
+    )
+    return 0
+
+
 def cmd_dashboard(args: argparse.Namespace) -> int:
     # --lan is the explicit, deliberate way to expose on the LAN; it overrides
     # --host so a phone can reach the dashboard without remembering 0.0.0.0.
@@ -426,6 +476,7 @@ def main(argv: list[str] | None = None) -> int:
         EditError,
         DashboardError,
         TranscribeError,
+        LabelError,
     ) as exc:
         print(f"benchcam: {exc}", file=sys.stderr)
         return 1

@@ -1,11 +1,17 @@
-"""Auto-label markers from spoken narration using Whisper.
+"""Transcribe spoken narration near each marker using Whisper.
 
 The bench workflow: while working, the operator presses a button/key to drop a
 marker AND says out loud what is happening ("chip lifted", "reflow start", ...).
 That narration is captured in the session's audio track. ``benchcam transcribe``
 runs Whisper locally on the capture's audio to get a timestamped transcript, then
-attaches the words spoken *around* each marker's ``elapsed_seconds`` as that
-marker's label.
+attaches the words spoken *around* each marker's ``elapsed_seconds`` to that
+marker's ``narration`` column.
+
+This is the FIRST of a two-step labeling pipeline; it only captures the raw
+narration. ``benchcam label`` then reads ``narration`` and summarizes it into the
+terse ``label``. Keeping raw narration in its own column means the two steps never
+clobber each other and each is independently re-runnable (re-transcribing never
+touches a terse label; re-labeling never touches the raw narration).
 
 Design notes:
 
@@ -17,12 +23,13 @@ Design notes:
   ``ImportError``.
 - This is meant to run on the laptop (GPU/RAM). It is a STANDALONE command and is
   intentionally NOT wired into ``benchcam edit``.
-- The transcript->marker join (:func:`label_for_marker` / :func:`plan_labels`) is
-  pure and is the unit-tested part; Whisper itself is mocked in tests.
-- Provenance is preserved: a transcribed label is only written to a marker whose
-  label is empty (unless ``--overwrite``), and the marker's ``source`` is tagged
-  with ``+transcribed`` so you can always tell an auto-label from a typed one
-  without losing the original origin (e.g. ``manual`` -> ``manual+transcribed``).
+- The transcript->marker join (:func:`narration_for_marker` / :func:`plan_narrations`)
+  is pure and is the unit-tested part; Whisper itself is mocked in tests.
+- Provenance is preserved: narration is only written to a marker whose
+  ``narration`` is empty (unless ``--overwrite``), and the marker's ``source`` is
+  tagged with ``+transcribed`` so you can always tell an auto-captured marker from
+  a purely typed one without losing the original origin (e.g. ``manual`` ->
+  ``manual+transcribed``). A terse ``label`` is never touched here.
 
 Capture audio is decoded by Whisper via ffmpeg, so the capture video file is fed
 to Whisper directly — no separate audio-extraction step.
@@ -37,7 +44,7 @@ from pathlib import Path
 from typing import Callable
 
 from .editor import find_capture, probe_has_audio
-from .markers import MARKERS_FILENAME, read_markers, set_marker_label
+from .markers import MARKERS_FILENAME, read_markers, update_marker
 
 DEFAULT_MODEL = "base"
 ENV_MODEL = "BENCHCAM_WHISPER_MODEL"
@@ -127,12 +134,12 @@ def transcribe_audio(capture: Path | str, model: str) -> list[TranscriptSegment]
 # Transcript -> marker join (pure, unit-tested)
 # --------------------------------------------------------------------------- #
 
-def is_meaningful_label(label: str | None) -> bool:
-    """True if a marker already has a real, operator-set label worth keeping."""
-    return bool((label or "").strip())
+def has_text(value: str | None) -> bool:
+    """True if a field already holds real (non-whitespace) content worth keeping."""
+    return bool((value or "").strip())
 
 
-def label_for_marker(
+def narration_for_marker(
     elapsed: float, segments: list[TranscriptSegment], window: float
 ) -> str:
     """Join the transcript text spoken within ``window`` seconds of a marker.
@@ -165,43 +172,44 @@ def _tag_source(source: str | None) -> str:
 
 
 @dataclass(frozen=True)
-class LabelAssignment:
-    """One marker that transcription will (re)label, with its new source tag."""
+class NarrationAssignment:
+    """One marker that transcription will (re)fill with narration, plus its tag."""
 
     marker_index: int
-    label: str
+    narration: str
     source: str
 
 
-def plan_labels(
+def plan_narrations(
     markers: list[dict],
     segments: list[TranscriptSegment],
     *,
     window: float = DEFAULT_WINDOW,
     overwrite: bool = False,
-) -> list[LabelAssignment]:
-    """Decide which markers get which transcribed labels (no I/O).
+) -> list[NarrationAssignment]:
+    """Decide which markers get which transcribed narration (no I/O).
 
-    - Markers that already have a meaningful label are skipped unless ``overwrite``.
+    - Markers that already have narration are skipped unless ``overwrite``. The
+      terse ``label`` is irrelevant here — narration and label are independent.
     - Markers with no transcript text in their window are left untouched (we never
-      blank out a label or write an empty one).
+      blank out narration or write an empty string).
     - The returned source tags preserve the original origin (e.g.
       ``manual`` -> ``manual+transcribed``).
     """
-    assignments: list[LabelAssignment] = []
+    assignments: list[NarrationAssignment] = []
     for row in markers:
         try:
             index = int(row["marker_index"])
             elapsed = float(row["elapsed_seconds"])
         except (KeyError, TypeError, ValueError):
             continue
-        if is_meaningful_label(row.get("label")) and not overwrite:
+        if has_text(row.get("narration")) and not overwrite:
             continue
-        label = label_for_marker(elapsed, segments, window)
-        if not label:
+        narration = narration_for_marker(elapsed, segments, window)
+        if not narration:
             continue
         assignments.append(
-            LabelAssignment(index, label, _tag_source(row.get("source")))
+            NarrationAssignment(index, narration, _tag_source(row.get("source")))
         )
     return assignments
 
@@ -217,8 +225,8 @@ def run_transcribe(
     window: float = DEFAULT_WINDOW,
     overwrite: bool = False,
     out: Callable[[str], object] = print,
-) -> list[LabelAssignment]:
-    """Transcribe a session's audio and auto-label its markers.
+) -> list[NarrationAssignment]:
+    """Transcribe a session's audio into each marker's ``narration`` column.
 
     Returns the assignments that were written (empty if nothing changed).
     """
@@ -249,21 +257,26 @@ def run_transcribe(
     segments = transcribe_audio(capture, model_name)
     out(f"Got {len(segments)} transcript segment(s).")
 
-    assignments = plan_labels(
+    assignments = plan_narrations(
         rows, segments, window=window, overwrite=overwrite
     )
     if not assignments:
-        out("No marker labels to fill (existing labels kept; use --overwrite to replace).")
+        out(
+            "No marker narration to fill (existing narration kept; use --overwrite "
+            "to replace)."
+        )
         return []
 
     for assignment in assignments:
-        set_marker_label(
+        update_marker(
             markers_file,
             assignment.marker_index,
-            assignment.label,
-            source=assignment.source,
+            {"narration": assignment.narration, "source": assignment.source},
         )
-        out(f"  marker #{assignment.marker_index}: {assignment.label!r}")
+        out(f"  marker #{assignment.marker_index}: {assignment.narration!r}")
 
-    out(f"Labeled {len(assignments)} marker(s) from transcription.")
+    out(
+        f"Captured narration for {len(assignments)} marker(s). Run "
+        "'benchcam label' to summarize it into terse labels."
+    )
     return assignments

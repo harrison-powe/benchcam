@@ -10,7 +10,16 @@ CSV columns:
 - elapsed_seconds seconds since the session started recording (run time)
 - wall_time       ISO 8601 local timestamp of the marker
 - source          where the marker came from (e.g. "manual", "external")
-- label           free-text description
+- label           terse event description (operator-typed, or AI-summarized by
+                  ``benchcam label`` from ``narration``)
+- narration       raw spoken narration near the marker, filled by
+                  ``benchcam transcribe``; the source material ``label`` is
+                  summarized from. Kept separate so the two steps never clobber
+                  each other and each stays independently re-runnable.
+
+``narration`` is the newest column and is appended last; older ``markers.csv``
+files (written before it existed) simply gain an empty ``narration`` on the next
+rewrite, and reads tolerate its absence.
 """
 
 from __future__ import annotations
@@ -27,6 +36,7 @@ FIELDNAMES = [
     "wall_time",
     "source",
     "label",
+    "narration",
 ]
 
 
@@ -37,6 +47,7 @@ class Marker:
     wall_time: str
     source: str
     label: str
+    narration: str = ""
 
     def as_row(self) -> dict:
         return {
@@ -45,6 +56,7 @@ class Marker:
             "wall_time": self.wall_time,
             "source": self.source,
             "label": self.label,
+            "narration": self.narration,
         }
 
 
@@ -81,28 +93,22 @@ def append_marker(path: Path, marker: Marker) -> None:
         writer.writerow(marker.as_row())
 
 
-def set_marker_label(
-    path: Path, marker_index: int, label: str, source: str | None = None
-) -> bool:
-    """Set the label of an existing marker (by index) and rewrite ``markers.csv``.
+def update_marker(path: Path, marker_index: int, updates: dict) -> bool:
+    """Update one existing marker's fields (by index) and rewrite ``markers.csv``.
 
-    Lets a marker be created instantly (no label) and labeled afterward. Only the
-    ``label`` field changes (and ``source`` if ``source`` is given); the columns
-    and the other values (including the formatted ``elapsed_seconds`` text) are
-    preserved exactly. ``source`` is optional so existing callers that only edit
-    the label (e.g. the dashboard) are unaffected; ``benchcam transcribe`` passes
-    it to record that the label came from audio transcription without losing the
-    marker's original origin. Returns True if a matching marker was found and
-    updated.
+    Only the fields named in ``updates`` change; every other column (including the
+    formatted ``elapsed_seconds`` text and any columns a caller doesn't know
+    about) is preserved exactly. This is the single rewrite path shared by the
+    label/narration/source editors so a marker can be created instantly and
+    enriched afterward without disturbing the rest of the row. Returns True if a
+    matching marker was found and updated.
     """
     path = Path(path)
     rows = read_markers(path)
     found = False
     for row in rows:
         if str(row.get("marker_index")) == str(marker_index):
-            row["label"] = label
-            if source is not None:
-                row["source"] = source
+            row.update(updates)
             found = True
     if not found:
         return False
@@ -112,3 +118,19 @@ def set_marker_label(
         for row in rows:
             writer.writerow({field: row.get(field, "") for field in FIELDNAMES})
     return True
+
+
+def set_marker_label(
+    path: Path, marker_index: int, label: str, source: str | None = None
+) -> bool:
+    """Set the ``label`` of an existing marker (by index), optionally its ``source``.
+
+    Lets a marker be created instantly (no label) and labeled afterward. ``source``
+    is optional so callers that only edit the label (e.g. the dashboard) are
+    unaffected; ``benchcam label`` passes it to tag an AI-summarized label without
+    losing the marker's original origin. Returns True if the marker was found.
+    """
+    updates: dict = {"label": label}
+    if source is not None:
+        updates["source"] = source
+    return update_marker(path, marker_index, updates)
