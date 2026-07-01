@@ -274,6 +274,17 @@ def _drawtext_filter(caption: Caption, fontfile: str | None) -> str:
     return "drawtext=" + ":".join(parts)
 
 
+#: Every audio segment is pinned to this exact format right before ``concat``.
+#: The silent filler (``anullsrc``, input 1) emits 8-bit ``u8`` samples on some
+#: ffmpeg builds and has no sample-format option; without this pin, ``concat``
+#: negotiates the lowest common format (``u8``) across all segments and
+#: down-converts the real narration to 8-bit, baking in quantization noise that
+#: is heard as static bursts at every silence->speech seam. Forcing a real float
+#: format (and a consistent rate/layout) on both branches keeps the narration at
+#: full precision regardless of the ffmpeg build's ``anullsrc`` behaviour.
+_AUDIO_SEGMENT_FORMAT = "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo"
+
+
 def build_filter_complex(
     plan: list[Segment],
     *,
@@ -284,7 +295,9 @@ def build_filter_complex(
 
     Input 0 is the capture video; input 1 is a silent ``anullsrc`` used for
     timelapsed (and audio-less) segments so every concatenated segment has a
-    matching audio stream.
+    matching audio stream. Every audio segment ends with an explicit
+    ``aformat`` (see ``_AUDIO_SEGMENT_FORMAT``) so ``concat`` never collapses the
+    narration to the filler's 8-bit format.
     """
     if not plan:
         raise EditError("Cannot build a filtergraph from an empty segment plan.")
@@ -305,12 +318,13 @@ def build_filter_complex(
 
         if seg.normal and has_audio:
             chains.append(
-                f"[0:a]atrim=start={s:.3f}:end={e:.3f},asetpts=PTS-STARTPTS[a{k}]"
+                f"[0:a]atrim=start={s:.3f}:end={e:.3f},"
+                f"asetpts=PTS-STARTPTS,{_AUDIO_SEGMENT_FORMAT}[a{k}]"
             )
         else:
             chains.append(
                 f"[1:a]atrim=start=0:end={seg.output_duration:.3f},"
-                f"asetpts=PTS-STARTPTS[a{k}]"
+                f"asetpts=PTS-STARTPTS,{_AUDIO_SEGMENT_FORMAT}[a{k}]"
             )
 
         concat_inputs.append(f"[v{k}][a{k}]")

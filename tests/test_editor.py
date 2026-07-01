@@ -156,14 +156,15 @@ def test_filtergraph_builds_segments_speeds_and_concat():
     ]
     fc = build_filter_complex(plan, fontfile=None, has_audio=True)
 
+    fmt = editor_mod._AUDIO_SEGMENT_FORMAT
     # Lapse segment: trimmed and sped up 8x, audio from the silent input.
     assert "[0:v]trim=start=0.000:end=10.000,setpts=(PTS-STARTPTS)/8[v0]" in fc
-    assert "[1:a]atrim=start=0:end=1.250,asetpts=PTS-STARTPTS[a0]" in fc  # 10/8
+    assert f"[1:a]atrim=start=0:end=1.250,asetpts=PTS-STARTPTS,{fmt}[a0]" in fc  # 10/8
     # Normal segment: 1x, real audio, caption burned in (literal, expansion off).
     assert "[0:v]trim=start=10.000:end=18.000,setpts=PTS-STARTPTS" in fc
     assert "drawtext=text=power on:expansion=none" in fc
     assert "enable=between(t\\,0.000\\,8.000)" in fc
-    assert "[0:a]atrim=start=10.000:end=18.000,asetpts=PTS-STARTPTS[a1]" in fc
+    assert f"[0:a]atrim=start=10.000:end=18.000,asetpts=PTS-STARTPTS,{fmt}[a1]" in fc
     assert "concat=n=2:v=1:a=1[outv][outa]" in fc
 
 
@@ -182,8 +183,9 @@ def test_filtergraph_silent_audio_for_all_segments_when_source_has_no_audio():
         Segment(10.0, 18.0, normal=True, speed=1.0),
     ]
     fc = build_filter_complex(plan, has_audio=False)
+    fmt = editor_mod._AUDIO_SEGMENT_FORMAT
     assert "[0:a]" not in fc  # never references the source audio
-    assert "[1:a]atrim=start=0:end=8.000,asetpts=PTS-STARTPTS[a1]" in fc  # normal, 1x
+    assert f"[1:a]atrim=start=0:end=8.000,asetpts=PTS-STARTPTS,{fmt}[a1]" in fc  # normal
 
 
 def test_filtergraph_no_drawtext_without_labels():
@@ -199,6 +201,33 @@ def test_filtergraph_escapes_tricky_label():
     ]
     fc = build_filter_complex(plan)
     assert r"text=it\'s 3\\:00" in fc
+
+
+def test_every_audio_segment_pins_an_explicit_sample_format():
+    # Regression guard: without an explicit sample format on EVERY audio segment,
+    # concat negotiates the lowest common format across segments. The silent
+    # anullsrc filler emits 8-bit u8 on some ffmpeg builds, which would drag the
+    # real narration down to 8-bit and add quantization static at the seams. Each
+    # [aN] label must therefore be produced by an aformat with a real float
+    # sample_fmt, for both real-audio and silent-only graphs.
+    import re
+
+    for has_audio in (True, False):
+        plan = build_segment_plan(
+            [(10.0, "power on"), (40.0, "fault")], duration=90.0
+        )
+        fc = build_filter_complex(plan, has_audio=has_audio)
+        labels = re.findall(r"\[a(\d+)\]", fc)
+        # Every audio segment label (excluding the concat consumer side) resolves
+        # to a chain ending in the explicit sample-format pin.
+        n_segments = len(plan)
+        for k in range(n_segments):
+            assert f"{editor_mod._AUDIO_SEGMENT_FORMAT}[a{k}]" in fc, (
+                f"segment a{k} is not pinned to an explicit sample format"
+            )
+        # And the pin must actually request a float sample_fmt (not u8/s16).
+        assert "sample_fmts=fltp" in editor_mod._AUDIO_SEGMENT_FORMAT
+        assert labels  # sanity: the graph really has audio segments
 
 
 def test_filtergraph_empty_plan_raises():
