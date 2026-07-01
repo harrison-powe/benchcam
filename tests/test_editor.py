@@ -168,6 +168,22 @@ def test_filtergraph_builds_segments_speeds_and_concat():
     assert "concat=n=2:v=1:a=1[outv][outa]" in fc
 
 
+def test_caption_is_top_left_chapter_tag():
+    # The marker label is burned as a top-left chapter tag (x=y=margin), not a
+    # bottom-centre subtitle, on a semi-transparent box, sized by the style knobs.
+    plan = [
+        Segment(0.0, 8.0, normal=True, speed=1.0,
+                captions=[editor_mod.Caption("Power Connected", 0.0, 8.0)]),
+    ]
+    fc = build_filter_complex(plan, fontfile=None)
+    assert f"x={editor_mod._CAPTION_MARGIN}:y={editor_mod._CAPTION_MARGIN}" in fc
+    assert f"fontsize={editor_mod._CAPTION_FONTSIZE}" in fc
+    assert f"boxcolor={editor_mod._CAPTION_BOXCOLOR}" in fc
+    # Not the old bottom-centre placement.
+    assert "x=(w-tw)/2" not in fc
+    assert "y=h-th-60" not in fc
+
+
 def test_filtergraph_includes_escaped_fontfile_when_given():
     plan = [
         Segment(0.0, 8.0, normal=True, speed=1.0,

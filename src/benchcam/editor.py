@@ -255,19 +255,32 @@ def _escape_fontfile(fontfile: str) -> str:
     return str(fontfile).replace("\\", "/").replace(":", "\\\\:")
 
 
+# Chapter-tag overlay style. Each marker's label is burned top-left as a small,
+# unobtrusive tag on a semi-transparent box while its normal-speed window plays.
+# These are the knobs to tune after eyeballing a render; the timing (whole marker
+# window, hard cut via enable=between) and gap behaviour (no label in timelapse)
+# are deliberately unchanged.
+_CAPTION_FONTSIZE = 32
+_CAPTION_MARGIN = 48  # pixels from the top-left corner
+_CAPTION_FONTCOLOR = "white"
+_CAPTION_BOXCOLOR = "black@0.5"  # semi-transparent backing box for legibility
+_CAPTION_BOXBORDERW = 10
+
+
 def _drawtext_filter(caption: Caption, fontfile: str | None) -> str:
     # expansion=none keeps labels literal (no %{...} expansion / "Stray %").
     parts = [f"text={_escape_drawtext(caption.text)}", "expansion=none"]
     if fontfile:
         parts.append(f"fontfile={_escape_fontfile(fontfile)}")
     parts += [
-        "fontcolor=white",
-        "fontsize=36",
+        f"fontcolor={_CAPTION_FONTCOLOR}",
+        f"fontsize={_CAPTION_FONTSIZE}",
         "box=1",
-        "boxcolor=black@0.5",
-        "boxborderw=12",
-        "x=(w-tw)/2",
-        "y=h-th-60",
+        f"boxcolor={_CAPTION_BOXCOLOR}",
+        f"boxborderw={_CAPTION_BOXBORDERW}",
+        # Top-left chapter tag (was bottom-centre). Fixed-pixel margin.
+        f"x={_CAPTION_MARGIN}",
+        f"y={_CAPTION_MARGIN}",
         # Escape the commas so the filtergraph parser keeps them inside between().
         f"enable=between(t\\,{caption.start:.3f}\\,{caption.end:.3f})",
     ]
