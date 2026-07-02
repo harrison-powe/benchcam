@@ -324,15 +324,26 @@ def _elapsed_baseline(session: Session) -> str:
     return session.started_wall_time or session.created_wall_time
 
 
+def elapsed_seconds(session: Session) -> float:
+    """Seconds elapsed since the session's baseline (run start, else creation).
+
+    The single source of truth for "how far into the recording are we". Used by
+    :func:`add_marker` and by the GPIO daemon's mute spans, so markers and mute
+    spans are measured against the *identical* baseline and line up. Clamped at 0.
+    """
+    now = clock.now()
+    baseline = clock.from_iso(_elapsed_baseline(session))
+    return max((now - baseline).total_seconds(), 0.0)
+
+
 def add_marker(session: Session, label: str, *, source: str = "manual") -> Marker:
     """Append a marker to the session and return it."""
     now = clock.now()
-    baseline = clock.from_iso(_elapsed_baseline(session))
-    elapsed = (now - baseline).total_seconds()
+    elapsed = elapsed_seconds(session)
     index = next_marker_index(session.markers_file)
     marker = Marker(
         marker_index=index,
-        elapsed_seconds=max(elapsed, 0.0),
+        elapsed_seconds=elapsed,
         wall_time=clock.to_iso(now),
         source=source,
         label=label,
