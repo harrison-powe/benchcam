@@ -244,6 +244,95 @@ def test_chapter_tag_persists_across_vad_normal_lapse_normal():
 
 
 # --------------------------------------------------------------------------- #
+# Mute spans (force-timelapse; the mirror of a marker)
+# --------------------------------------------------------------------------- #
+
+def test_mute_spans_absent_is_backward_compatible_noop():
+    # No mute_spans (or None/[]) must equal the plan without the param at all —
+    # byte-identical spans/kinds/captions, on both marker-only and VAD paths.
+    events = [(18.8, "a"), (34.9, "b"), (47.1, "c")]
+    base = build_segment_plan(events, 60.0, pre=3, post=5, speed=8)
+    for mutes in (None, []):
+        same = build_segment_plan(events, 60.0, pre=3, post=5, speed=8, mute_spans=mutes)
+        assert _spans(base) == _spans(same) and _kinds(base) == _kinds(same)
+
+    vbase = build_segment_plan(
+        events, 60.0, pre=3, post=5, speed=8, speech_spans=[(30.0, 35.0)], min_lapse=5.0
+    )
+    vsame = build_segment_plan(
+        events, 60.0, pre=3, post=5, speed=8, speech_spans=[(30.0, 35.0)], min_lapse=5.0,
+        mute_spans=[],
+    )
+    assert _spans(vbase) == _spans(vsame) and _kinds(vbase) == _kinds(vsame)
+    caps = lambda plan: [[c.text for c in s.captions] for s in plan]
+    assert caps(vbase) == caps(vsame)
+
+
+def test_mute_span_beyond_duration_or_zero_length_is_noop():
+    # A span clamped to nothing (past the end) and a zero-length safety-close span
+    # must both leave the plan untouched.
+    events = [(20.0, "a")]
+    base = build_segment_plan(events, 60.0, pre=3, post=5, speed=8)
+    same = build_segment_plan(
+        events, 60.0, pre=3, post=5, speed=8, mute_spans=[(100.0, 110.0), (30.0, 30.0)]
+    )
+    assert _spans(base) == _spans(same) and _kinds(base) == _kinds(same)
+
+
+def test_mute_overrides_marker_window_and_speech_below_min_lapse():
+    # Precedence proof: a marker window [9,17] AND a VAD speech span [15,25] union
+    # to one normal block [9,25]. A 3s mute [16,19] — shorter than min_lapse=5 and
+    # overlapping BOTH the marker window and the speech span — must still force a
+    # LAPSE over exactly [16,19].
+    events = [(12.0, "chip")]
+    speech = [(15.0, 25.0)]
+
+    # Control: without the mute, [9,25] is a single normal block (no mid lapse).
+    without = build_segment_plan(
+        events, 60.0, pre=3, post=5, speed=8, speech_spans=speech, min_lapse=5.0
+    )
+    assert _spans(without) == [(0.0, 9.0), (9.0, 25.0), (25.0, 60.0)]
+    assert _kinds(without) == ["lapse", "normal", "lapse"]
+
+    plan = build_segment_plan(
+        events, 60.0, pre=3, post=5, speed=8, speech_spans=speech, min_lapse=5.0,
+        mute_spans=[(16.0, 19.0)],
+    )
+    assert _kinds(plan) == ["lapse", "normal", "lapse", "normal", "lapse"]
+    assert _spans(plan) == [
+        (0.0, 9.0), (9.0, 16.0), (16.0, 19.0), (19.0, 25.0), (25.0, 60.0)
+    ]
+    # The muted region is a LAPSE at the timelapse speed, despite being 3s < 5s
+    # min_lapse and inside both a marker window and a speech span.
+    muted = [s for s in plan if (round(s.start, 3), round(s.end, 3)) == (16.0, 19.0)]
+    assert len(muted) == 1
+    lap = muted[0]
+    assert not lap.normal and lap.speed == 8.0
+
+    # And the chapter tag still persists across the muted-lapsed region, retimed
+    # via (x - seg.start)/speed: (16-16)/8=0 .. (19-16)/8=0.375.
+    sep = editor_mod._CAPTION_NUMBER_SEP
+    assert len(lap.captions) == 1
+    assert lap.captions[0].text == f"01{sep}chip"
+    assert (round(lap.captions[0].start, 3), round(lap.captions[0].end, 3)) == (0.0, 0.375)
+
+
+def test_read_mute_spans_skips_zero_length_inverted_and_absent(tmp_path):
+    # Absent file -> [] (the whole no-op guarantee rests on this).
+    assert editor_mod.read_mute_spans(tmp_path) == []
+
+    (tmp_path / "mute_spans.csv").write_text(
+        "start_seconds,end_seconds,start_wall_time,end_wall_time,span_index,source\n"
+        "10.000,20.000,w,x,1,gpio\n"    # valid
+        "30.000,30.000,w,x,2,gpio\n"    # zero-length safety close -> skip
+        "50.000,45.000,w,x,3,gpio\n"    # inverted -> skip
+        "oops,5,w,x,4,gpio\n",          # unparseable -> skip
+        encoding="utf-8",
+    )
+    assert editor_mod.read_mute_spans(tmp_path) == [(10.0, 20.0)]
+
+
+# --------------------------------------------------------------------------- #
 # detect_speech_spans (silero + ffmpeg mocked; no torch/silero installed)
 # --------------------------------------------------------------------------- #
 

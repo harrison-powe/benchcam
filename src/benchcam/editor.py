@@ -122,6 +122,35 @@ def read_events(session_dir: Path) -> list[tuple[float, str]]:
     return events
 
 
+#: Written by the Pi GPIO daemon next to markers.csv; the mirror of a marker.
+#: A marker forces NORMAL speed; a mute span forces LAPSE speed (see
+#: build_segment_plan). Columns: start_seconds,end_seconds,start_wall_time,
+#: end_wall_time,span_index,source — only the two seconds columns matter here.
+MUTE_SPANS_FILENAME = "mute_spans.csv"
+
+
+def read_mute_spans(session_dir: Path) -> list[tuple[float, float]]:
+    """Read force-timelapse spans ``[(start, end), ...]`` from mute_spans.csv.
+
+    In SOURCE seconds. An absent file yields ``[]`` (unchanged edit behavior),
+    the same graceful pattern as a session with no markers — ``read_markers``
+    returns ``[]`` for a missing file. Zero-length or inverted spans
+    (``end <= start``) are skipped: the daemon can write ``end == start`` on a
+    safety close, and those must be no-ops. Unparseable rows are skipped too,
+    mirroring ``read_events``'s tolerance.
+    """
+    spans: list[tuple[float, float]] = []
+    for row in read_markers(Path(session_dir) / MUTE_SPANS_FILENAME):
+        try:
+            start = float(row.get("start_seconds", ""))
+            end = float(row.get("end_seconds", ""))
+        except (TypeError, ValueError):
+            continue
+        if end > start:
+            spans.append((start, end))
+    return spans
+
+
 # --------------------------------------------------------------------------- #
 # Segment planning (pure)
 # --------------------------------------------------------------------------- #
@@ -144,6 +173,37 @@ def _merge_intervals(
     return merged
 
 
+def _subtract_intervals(
+    blocks: list[tuple[float, float]], holes: list[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    """Return ``blocks`` with every ``holes`` interval removed (interval diff).
+
+    ``blocks`` must be sorted and non-overlapping (as ``_merge_intervals`` yields).
+    ``holes`` are normalized first (invalid dropped, then merged) so overlapping
+    or unsorted holes are handled. A hole carves its overlap out of any block,
+    splitting it; a block untouched by any hole passes through unchanged.
+    """
+    holes = _merge_intervals([(s, e) for s, e in holes if e > s], 0.0)
+    if not holes:
+        return list(blocks)
+    result: list[tuple[float, float]] = []
+    for bs, be in blocks:
+        cursor = bs
+        for hs, he in holes:  # holes sorted ascending, non-overlapping
+            if he <= cursor:
+                continue  # hole is entirely before the remaining piece
+            if hs >= be:
+                break  # this hole (and all later) start at/after the block end
+            if hs > cursor:
+                result.append((cursor, hs))  # keep the piece before the hole
+            cursor = he  # skip past the muted part
+            if cursor >= be:
+                break
+        if cursor < be:
+            result.append((cursor, be))  # tail after the last hole
+    return result
+
+
 def build_segment_plan(
     events: list[tuple[float, str]],
     duration: float,
@@ -156,6 +216,7 @@ def build_segment_plan(
     speech_pad_trail: float = 0.0,
     merge_gap: float = 0.0,
     min_lapse: float = 0.0,
+    mute_spans: list[tuple[float, float]] | None = None,
 ) -> list[Segment]:
     """Compute the ordered review segments for a video of ``duration`` seconds.
 
@@ -173,8 +234,14 @@ def build_segment_plan(
     attached afterwards from the markers (see ``_attach_chapter_captions``), so a
     chapter label still persists across whatever segments result.
 
-    The defaults (``speech_spans=None``, ``merge_gap=0``, ``min_lapse=0``)
-    reproduce the marker-only tiling exactly, so plain ``edit`` is unchanged.
+    ``mute_spans`` (in source seconds) are the mirror of a marker: they FORCE
+    timelapse, subtracted from the normal-speed union after the merges, so a mute
+    overrides speech, a marker window, and ``min_lapse`` alike. A chapter label
+    still draws across the resulting lapse segment via the unchanged retiming map.
+
+    The defaults (``speech_spans=None``, ``merge_gap=0``, ``min_lapse=0``,
+    ``mute_spans=None``) reproduce the marker-only tiling exactly, so plain
+    ``edit`` is unchanged.
     """
     if duration <= 0:
         return []
@@ -196,6 +263,19 @@ def build_segment_plan(
 
     # (a) union, bridging short pauses; (b) absorb gaps too short to timelapse.
     blocks = _merge_intervals(_merge_intervals(intervals, merge_gap), min_lapse)
+
+    # Mute spans FORCE timelapse: subtract them from the normal-speed union AFTER
+    # the merges above, so a mute overrides speech, a marker window, AND min_lapse
+    # (a muted hole shorter than min_lapse still lapses — it can't be re-absorbed
+    # here). The walk below turns whatever gap this carves into a _lapse.
+    mutes: list[tuple[float, float]] = []
+    for raw_start, raw_end in mute_spans or []:
+        s = min(max(raw_start, 0.0), duration)
+        e = min(max(raw_end, 0.0), duration)
+        if e > s:  # drop zero-length / inverted (incl. spans clamped to nothing)
+            mutes.append((s, e))
+    if mutes:
+        blocks = _subtract_intervals(blocks, mutes)
 
     # (c) Walk the timeline, filling the remaining gaps with timelapse segments.
     # Captions are attached in a second pass because a chapter label spans
@@ -776,6 +856,8 @@ def run_edit(
     has_audio = probe_has_audio(capture, ffprobe=ffprobe)
 
     events = read_events(session_dir)
+    # Force-timelapse spans written by the Pi daemon (absent file -> [], no-op).
+    mute_spans = read_mute_spans(session_dir)
 
     # Opt-in speech-aware speed. On any problem, fall back to marker-only so a
     # plain (or degraded) edit still renders — never crash the whole command.
@@ -806,7 +888,10 @@ def run_edit(
         speech_pad_trail=speech_pad_trail,
         merge_gap=merge_gap if use_speech else 0.0,
         min_lapse=min_lapse if use_speech else 0.0,
+        mute_spans=mute_spans,
     )
+    if mute_spans:
+        out(f"{len(mute_spans)} mute span(s) forced to timelapse.")
 
     out(f"Editing {capture.name} ({duration:.1f}s, audio={'yes' if has_audio else 'no'}).")
     out(describe_plan(plan, speed=speed, marker_count=len(events)))
