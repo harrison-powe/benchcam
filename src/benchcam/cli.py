@@ -91,6 +91,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="Recorder backend (default: null).",
     )
     p_new.add_argument("--notes", default="", help="Initial notes text.")
+    p_new.add_argument(
+        "--min-session-minutes",
+        type=float,
+        default=None,
+        help=(
+            "Pre-flight free-space floor: minutes of recording the capture disk "
+            "must have room for before 'run'/START will begin (default: 20; also "
+            "$BENCHCAM_MIN_SESSION_MINUTES). Stored in session.json."
+        ),
+    )
+    p_new.add_argument(
+        "--capture-rate-mb-min",
+        type=float,
+        default=None,
+        help=(
+            "Pre-flight free-space floor: assumed capture rate in MB/min, "
+            "multiplied by --min-session-minutes to size the floor (default: 610; "
+            "also $BENCHCAM_CAPTURE_RATE_MB_MIN). Stored in session.json."
+        ),
+    )
     p_new.set_defaults(func=cmd_new)
 
     # run
@@ -351,6 +371,8 @@ def cmd_new(args: argparse.Namespace) -> int:
         microphone=args.microphone,
         recorder=args.recorder,
         notes=args.notes,
+        min_session_minutes=args.min_session_minutes,
+        capture_rate_mb_per_min=args.capture_rate_mb_min,
     )
     print(f"Created session {session.session_id}")
     print(f"  folder:   {session.storage_path}")

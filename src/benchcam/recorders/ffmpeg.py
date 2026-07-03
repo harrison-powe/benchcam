@@ -73,6 +73,8 @@ ENV_MICROPHONE = "BENCHCAM_MICROPHONE"
 ENV_VIDEO_SIZE = "BENCHCAM_VIDEO_SIZE"
 ENV_FRAMERATE = "BENCHCAM_FRAMERATE"
 ENV_INPUT_FORMAT = "BENCHCAM_INPUT_FORMAT"
+ENV_MIN_SESSION_MINUTES = "BENCHCAM_MIN_SESSION_MINUTES"
+ENV_CAPTURE_RATE_MB_MIN = "BENCHCAM_CAPTURE_RATE_MB_MIN"
 
 DEFAULT_WIDTH = 1920
 DEFAULT_HEIGHT = 1080
@@ -85,6 +87,19 @@ DEFAULT_VIDEO_DEVICE = "/dev/video0"
 DEFAULT_AUDIO_DEVICE = "plughw:CARD=Nano,DEV=0"
 DEFAULT_AUDIO_RATE = 44100
 DEFAULT_AUDIO_CHANNELS = 2
+
+#: Pre-flight free-space floor. A real session died when the microSD filled
+#: mid-recording: ffmpeg hit "No space left on device", was killed, and left a
+#: headerless MKV that 'benchcam edit' could not parse. Before capture starts we
+#: require the capture disk to hold at least DEFAULT_MIN_SESSION_MINUTES of
+#: recording at DEFAULT_CAPTURE_RATE_MB_PER_MIN (~610 MB/min for 1080p30 MJPEG
+#: from a C920). 20 min x 610 MB/min ~= 12.2 GB. Both knobs are tunable
+#: (constructor > session.json > env > default) for a bigger/smaller card or a
+#: different codec/bitrate.
+DEFAULT_MIN_SESSION_MINUTES = 20.0
+DEFAULT_CAPTURE_RATE_MB_PER_MIN = 610.0
+#: MB/GB here are decimal (10^6 / 10^9), matching SD-card labeling and MB/min.
+_BYTES_PER_MB = 1_000_000
 
 #: Seconds to wait for ffmpeg to finalize after a graceful stop before force-kill.
 STOP_TIMEOUT_SECONDS = 8.0
@@ -247,16 +262,110 @@ def _resolve_fps() -> int:
         return DEFAULT_FPS
 
 
+# --------------------------------------------------------------------------- #
+# Pre-flight free-space guard (pure arithmetic + config resolution)
+# --------------------------------------------------------------------------- #
+
+def required_free_bytes(rate_mb_per_min: float, min_minutes: float) -> int:
+    """Bytes needed to hold ``min_minutes`` of capture at ``rate_mb_per_min``.
+
+    Pure arithmetic (no I/O) so the floor is unit-testable in isolation.
+    Negative knobs are clamped to 0, which disables the floor rather than
+    computing a nonsensical negative requirement.
+    """
+    rate = max(float(rate_mb_per_min), 0.0)
+    minutes = max(float(min_minutes), 0.0)
+    return int(rate * minutes * _BYTES_PER_MB)
+
+
+def _float_from_session(storage_path: Path, key: str) -> float | None:
+    """Read a numeric field (e.g. ``min_session_minutes``) from ``session.json``.
+
+    Mirrors :func:`_field_from_session` but for numbers; returns ``None`` when the
+    file/key is missing or the value is not a real number (``bool`` is rejected
+    even though it is numeric in Python).
+    """
+    session_file = Path(storage_path) / SESSION_FILENAME
+    try:
+        data = json.loads(session_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    value = data.get(key)
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_float_knob(
+    override: float | None,
+    storage_path: Path,
+    session_key: str,
+    env_key: str,
+    default: float,
+) -> float:
+    """Resolve a numeric knob: constructor > session.json > env > default.
+
+    The same precedence :meth:`FfmpegRecorder._resolve_device` uses for the
+    camera, so the free-space floor is configured the BenchCam way.
+    """
+    if override is not None:
+        return float(override)
+    from_session = _float_from_session(storage_path, session_key)
+    if from_session is not None:
+        return from_session
+    raw = os.environ.get(env_key, "").strip()
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return default
+
+
+def _existing_ancestor(path: Path) -> Path:
+    """Nearest existing directory at or above ``path`` (for ``disk_usage``).
+
+    The session folder normally exists by the time :meth:`start` runs, but
+    walking up keeps the free-space probe from raising if it somehow does not.
+    """
+    p = Path(path)
+    while not p.exists():
+        parent = p.parent
+        if parent == p:
+            return p
+        p = parent
+    return p
+
+
+def _format_gb(num_bytes: float) -> str:
+    """Human-readable decimal GB (matches SD-card labeling)."""
+    return f"{num_bytes / 1_000_000_000:.1f} GB"
+
+
 class FfmpegRecorder(Recorder):
     """Record one webcam capture per session via an ffmpeg subprocess."""
 
     name = "ffmpeg"
 
-    def __init__(self, camera: str | None = None, microphone: str | None = None) -> None:
+    def __init__(
+        self,
+        camera: str | None = None,
+        microphone: str | None = None,
+        *,
+        min_session_minutes: float | None = None,
+        capture_rate_mb_per_min: float | None = None,
+    ) -> None:
         self._camera = camera
         # ``None`` means "fall back to session.json/env/default"; an explicit ""
         # disables audio (video only) on the Linux path.
         self._microphone = microphone
+        # Pre-flight free-space floor knobs. ``None`` means "fall back to
+        # session.json/env/default"; set explicitly to override the resolution.
+        self._min_session_minutes = min_session_minutes
+        self._capture_rate_mb_per_min = capture_rate_mb_per_min
         self._process: subprocess.Popen | None = None
         self._log_handle = None
         self._output_path: Path | None = None
@@ -302,8 +411,58 @@ class FfmpegRecorder(Recorder):
             return from_env
         return DEFAULT_AUDIO_DEVICE
 
+    def _check_free_space(self, storage_path: Path) -> None:
+        """Refuse to start when the capture disk can't hold a minimal session.
+
+        Reads free space on the actual mount holding ``storage_path`` (the session
+        folder, which lives under the sessions root) *at call time* — never a
+        value cached at session creation — so a card that filled between
+        ``benchcam new`` and ``benchcam run`` is still caught. Raises
+        :class:`RecorderError` (before any ffmpeg is spawned) when free space is
+        below the floor; returns silently when there is room. The floor is
+        ``rate_mb_per_min * min_minutes``, both resolved constructor >
+        session.json > env > default.
+        """
+        min_minutes = _resolve_float_knob(
+            self._min_session_minutes,
+            storage_path,
+            "min_session_minutes",
+            ENV_MIN_SESSION_MINUTES,
+            DEFAULT_MIN_SESSION_MINUTES,
+        )
+        rate = _resolve_float_knob(
+            self._capture_rate_mb_per_min,
+            storage_path,
+            "capture_rate_mb_per_min",
+            ENV_CAPTURE_RATE_MB_MIN,
+            DEFAULT_CAPTURE_RATE_MB_PER_MIN,
+        )
+        required = required_free_bytes(rate, min_minutes)
+        if required <= 0:
+            return  # a zero/negative knob deliberately disables the floor
+        probe = _existing_ancestor(storage_path)
+        free = shutil.disk_usage(probe).free
+        if free >= required:
+            return
+        shortfall = required - free
+        raise RecorderError(
+            f"Not enough free space to start capture on {probe}.\n"
+            f"  free:     {_format_gb(free)}\n"
+            f"  required: {_format_gb(required)}  "
+            f"({min_minutes:g} min x {rate:g} MB/min)\n"
+            f"  short by: {_format_gb(shortfall)}\n"
+            "Free up space, or lower the floor with --min-session-minutes / "
+            "BENCHCAM_MIN_SESSION_MINUTES. ffmpeg was NOT started."
+        )
+
     def start(self, storage_path: Path) -> None:
         storage_path = Path(storage_path)
+
+        # Pre-flight: refuse to start if the capture disk can't hold a minimal
+        # session, so a nearly-full card can't leave a headerless, unparseable
+        # capture. Runs before any ffmpeg spawns. Pre-flight only — there is no
+        # mid-capture monitoring or auto-stop here.
+        self._check_free_space(storage_path)
 
         ffmpeg_bin = shutil.which("ffmpeg")
         if ffmpeg_bin is None:

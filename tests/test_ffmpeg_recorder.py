@@ -6,6 +6,7 @@ No real ffmpeg and no real camera are used: ``subprocess.Popen`` and
 
 from __future__ import annotations
 
+import collections
 import signal
 import subprocess
 from unittest import mock
@@ -19,17 +20,23 @@ from benchcam.recorders.ffmpeg import (
     CAPTURE_FILENAME,
     CAPTURE_FILENAME_MKV,
     DEFAULT_AUDIO_DEVICE,
+    DEFAULT_CAPTURE_RATE_MB_PER_MIN,
+    DEFAULT_MIN_SESSION_MINUTES,
     DEFAULT_VIDEO_DEVICE,
     ENV_CAMERA,
+    ENV_CAPTURE_RATE_MB_MIN,
     ENV_FRAMERATE,
     ENV_INPUT_FORMAT,
     ENV_MICROPHONE,
+    ENV_MIN_SESSION_MINUTES,
     ENV_VIDEO_SIZE,
     PIDFILE_FILENAME,
     FfmpegRecorder,
     build_ffmpeg_command,
     build_list_devices_command,
     capture_filename,
+    required_free_bytes,
+    _resolve_float_knob,
 )
 
 DEVICE = "HD Pro Webcam C920S"
@@ -37,6 +44,31 @@ LINUX_DEVICE = "/dev/video0"
 ALSA_DEVICE = "plughw:CARD=Nano,DEV=0"
 # SIGKILL on POSIX; SIGTERM stand-in where SIGKILL is unavailable (Windows).
 EXPECTED_SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
+
+# 64 GB — well above the default 12.2 GB pre-flight floor.
+_AMPLE_FREE = 64_000_000_000
+
+
+def _usage(free):
+    """A shutil.disk_usage-shaped result with the given free bytes."""
+    return collections.namedtuple("usage", ["total", "used", "free"])(
+        total=_AMPLE_FREE, used=max(_AMPLE_FREE - free, 0), free=free
+    )
+
+
+@pytest.fixture(autouse=True)
+def _ample_disk_space(monkeypatch):
+    """Default every start() to a disk with ample room.
+
+    start()'s pre-flight free-space guard calls shutil.disk_usage; unit tests
+    must not depend on the real free space of the machine running them (least of
+    all the Pi checkout, whose card is the very thing that fills). Tests that
+    exercise the refusal path re-patch disk_usage to a low value themselves.
+    """
+    monkeypatch.setattr(
+        "benchcam.recorders.ffmpeg.shutil.disk_usage",
+        lambda _p: _usage(_AMPLE_FREE),
+    )
 
 
 def _pair_at(cmd, flag, value):
@@ -474,6 +506,165 @@ def test_stop_via_pidfile_stale_pid_is_cleaned_up(tmp_path, monkeypatch):
 def test_stop_is_safe_when_never_started():
     rec = FfmpegRecorder()
     rec.stop()  # no process; must not raise
+
+
+# --------------------------------------------------------------------------- #
+# Pre-flight free-space guard
+# --------------------------------------------------------------------------- #
+
+def test_required_free_bytes_arithmetic():
+    # 20 min x 610 MB/min x 1e6 = 12.2 GB.
+    assert required_free_bytes(610, 20) == 12_200_000_000
+    # Negative/zero knobs clamp to 0 (floor disabled), never a negative floor.
+    assert required_free_bytes(-5, 20) == 0
+    assert required_free_bytes(610, 0) == 0
+
+
+def test_resolve_float_knob_precedence(tmp_path, monkeypatch):
+    root = tmp_path / "sessions"
+    # session.json carries a value; the env carries a different one.
+    session = session_mod.create_session(root=root, min_session_minutes=15)
+    monkeypatch.setenv(ENV_MIN_SESSION_MINUTES, "8")
+
+    args = ("min_session_minutes", ENV_MIN_SESSION_MINUTES, DEFAULT_MIN_SESSION_MINUTES)
+
+    # constructor override wins over everything.
+    assert _resolve_float_knob(30.0, session.folder, *args) == 30.0
+    # no override -> session.json wins over env.
+    assert _resolve_float_knob(None, session.folder, *args) == 15.0
+
+    # no override, no session value -> env wins over default.
+    bare = session_mod.create_session(root=root)  # no knob written
+    assert _resolve_float_knob(None, bare.folder, *args) == 8.0
+    # nothing set anywhere -> default.
+    monkeypatch.delenv(ENV_MIN_SESSION_MINUTES, raising=False)
+    assert _resolve_float_knob(None, bare.folder, *args) == DEFAULT_MIN_SESSION_MINUTES
+
+
+def test_start_refuses_below_free_space_floor_and_never_spawns(tmp_path, monkeypatch):
+    monkeypatch.setattr("benchcam.recorders.ffmpeg.sys.platform", "linux")
+    root = tmp_path / "sessions"
+    session = session_mod.create_session(root=root, camera="/dev/video0")
+    # Only 1 GB free — far below the 12.2 GB default floor.
+    monkeypatch.setattr(
+        "benchcam.recorders.ffmpeg.shutil.disk_usage",
+        lambda _p: _usage(1_000_000_000),
+    )
+
+    with mock.patch(
+        "benchcam.recorders.ffmpeg.shutil.which", return_value="/usr/bin/ffmpeg"
+    ), mock.patch("benchcam.recorders.ffmpeg.subprocess.Popen") as popen:
+        rec = FfmpegRecorder()
+        with pytest.raises(RecorderError) as exc:
+            rec.start(session.folder)
+
+    msg = str(exc.value)
+    assert "free space" in msg.lower()
+    assert "NOT started" in msg  # tells the operator ffmpeg did not run
+    popen.assert_not_called()  # ffmpeg must never spawn below the floor
+    # Nothing half-started left behind on the recorder or on disk.
+    assert rec.output_path is None
+    assert not (session.folder / PIDFILE_FILENAME).exists()
+
+
+def test_start_allows_when_free_space_exactly_meets_floor(tmp_path, monkeypatch):
+    monkeypatch.setattr("benchcam.recorders.ffmpeg.sys.platform", "linux")
+    root = tmp_path / "sessions"
+    session = session_mod.create_session(root=root, camera="/dev/video0")
+    # Exactly the default floor -> allowed (the check is free >= required).
+    floor = required_free_bytes(
+        DEFAULT_CAPTURE_RATE_MB_PER_MIN, DEFAULT_MIN_SESSION_MINUTES
+    )
+    monkeypatch.setattr(
+        "benchcam.recorders.ffmpeg.shutil.disk_usage", lambda _p: _usage(floor)
+    )
+
+    with mock.patch(
+        "benchcam.recorders.ffmpeg.shutil.which", return_value="/usr/bin/ffmpeg"
+    ), mock.patch(
+        "benchcam.recorders.ffmpeg.subprocess.Popen", return_value=mock.MagicMock()
+    ) as popen:
+        FfmpegRecorder().start(session.folder)
+
+    popen.assert_called_once()  # at the floor, capture proceeds
+
+
+def test_start_reads_free_space_at_start_not_creation(tmp_path, monkeypatch):
+    # A card that had room at 'new' but filled before 'run' must still be caught:
+    # the guard reads disk_usage at start() time, not a value cached at creation.
+    monkeypatch.setattr("benchcam.recorders.ffmpeg.sys.platform", "linux")
+    root = tmp_path / "sessions"
+    # create_session runs under the autouse ample-disk fixture (room at 'new').
+    session = session_mod.create_session(root=root, camera="/dev/video0")
+    # Now the card is nearly full at run time.
+    monkeypatch.setattr(
+        "benchcam.recorders.ffmpeg.shutil.disk_usage",
+        lambda _p: _usage(500_000_000),
+    )
+
+    with mock.patch(
+        "benchcam.recorders.ffmpeg.shutil.which", return_value="/usr/bin/ffmpeg"
+    ), mock.patch("benchcam.recorders.ffmpeg.subprocess.Popen") as popen:
+        with pytest.raises(RecorderError):
+            FfmpegRecorder().start(session.folder)
+
+    popen.assert_not_called()
+
+
+def test_start_floor_honors_session_json_override(tmp_path, monkeypatch):
+    # A per-session floor from session.json raises the bar: 40 min x 610 MB/min
+    # ~= 24.4 GB, so 20 GB free (fine under the default) is now refused.
+    monkeypatch.setattr("benchcam.recorders.ffmpeg.sys.platform", "linux")
+    root = tmp_path / "sessions"
+    session = session_mod.create_session(
+        root=root, camera="/dev/video0", min_session_minutes=40
+    )
+    monkeypatch.setattr(
+        "benchcam.recorders.ffmpeg.shutil.disk_usage",
+        lambda _p: _usage(20_000_000_000),
+    )
+
+    with mock.patch(
+        "benchcam.recorders.ffmpeg.shutil.which", return_value="/usr/bin/ffmpeg"
+    ), mock.patch("benchcam.recorders.ffmpeg.subprocess.Popen") as popen:
+        with pytest.raises(RecorderError):
+            FfmpegRecorder().start(session.folder)
+
+    popen.assert_not_called()
+
+
+def test_run_below_floor_never_reaches_start_session(tmp_path, monkeypatch):
+    # End-to-end through the CLI 'run' path: below the floor, the refusal must
+    # surface as a clean error AND leave no half-running session — start_session()
+    # is never reached, so status stays 'created' with no start stamp. (The
+    # .active pointer already exists from 'new'; the meaningful check is that the
+    # session was never marked running.)
+    from benchcam import cli
+
+    monkeypatch.setattr("benchcam.recorders.ffmpeg.sys.platform", "linux")
+    root = tmp_path / "sessions"
+    session = session_mod.create_session(
+        root=root, camera="/dev/video0", recorder="ffmpeg"
+    )
+    monkeypatch.setattr(
+        "benchcam.recorders.ffmpeg.shutil.disk_usage",
+        lambda _p: _usage(1_000_000_000),
+    )
+
+    started = []
+    monkeypatch.setattr(session_mod, "start_session", lambda s: started.append(s))
+
+    with mock.patch(
+        "benchcam.recorders.ffmpeg.shutil.which", return_value="/usr/bin/ffmpeg"
+    ), mock.patch("benchcam.recorders.ffmpeg.subprocess.Popen") as popen:
+        rc = cli.main(["run", "--sessions-root", str(root)])
+
+    assert rc == 1  # refusal surfaced as a clean non-zero exit
+    popen.assert_not_called()  # ffmpeg never spawned
+    assert started == []  # start_session() never reached
+    reloaded = session_mod.load_session(session.folder)
+    assert reloaded.status == session_mod.STATUS_CREATED
+    assert reloaded.started_wall_time is None
 
 
 def test_get_recorder_ffmpeg_returns_instance():

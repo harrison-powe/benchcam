@@ -28,6 +28,25 @@ def test_full_cli_flow(tmp_path, capsys):
     assert rows[1]["source"] == "external"
 
 
+def test_new_persists_free_space_floor_knobs_to_session_json(tmp_path):
+    # The pre-flight free-space knobs set on 'new' must land in session.json so
+    # every start path (run/live/dashboard/GPIO START) resolves the same floor.
+    root = tmp_path / "sessions"
+    assert main([
+        "new", "--sessions-root", str(root),
+        "--min-session-minutes", "30",
+        "--capture-rate-mb-min", "700",
+    ]) == 0
+
+    session = session_mod.get_active_session(root)
+    assert session.min_session_minutes == 30.0
+    assert session.capture_rate_mb_per_min == 700.0
+    # Unset by default (falls back to env/default at start time).
+    plain = session_mod.create_session(root=root)
+    assert plain.min_session_minutes is None
+    assert plain.capture_rate_mb_per_min is None
+
+
 def test_mark_without_session_returns_error(tmp_path, capsys):
     root = str(tmp_path / "sessions")
     rc = main(["mark", "--sessions-root", root, "oops"])

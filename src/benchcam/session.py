@@ -77,6 +77,12 @@ class Session:
     status: str = STATUS_CREATED
     started_wall_time: str | None = None
     ended_wall_time: str | None = None
+    #: Pre-flight free-space floor knobs consumed by FfmpegRecorder.start()
+    #: (constructor > session.json > env > default). ``None`` means "unset — fall
+    #: back to env/default"; set via 'benchcam new --min-session-minutes /
+    #: --capture-rate-mb-min'. Older session.json without these loads fine.
+    min_session_minutes: float | None = None
+    capture_rate_mb_per_min: float | None = None
 
     @property
     def folder(self) -> Path:
@@ -137,6 +143,8 @@ def create_session(
     recorder: str = "null",
     notes: str = "",
     name: str = "",
+    min_session_minutes: float | None = None,
+    capture_rate_mb_per_min: float | None = None,
     set_active: bool = True,
 ) -> Session:
     """Create a new session folder with its three files and return the Session.
@@ -166,6 +174,8 @@ def create_session(
         notes=notes,
         name=(name or "").strip(),
         status=STATUS_CREATED,
+        min_session_minutes=min_session_minutes,
+        capture_rate_mb_per_min=capture_rate_mb_per_min,
     )
     session.save()
 
