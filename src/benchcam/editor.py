@@ -649,6 +649,77 @@ def run_ffmpeg_command(cmd: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
+#: Sidecar written by the lossless-remux recovery below. A fixed name (per
+#: container) so re-runs overwrite it via ``-y`` instead of accumulating copies.
+REMUX_SIDECAR_STEM = "capture.remuxed"
+
+
+def build_remux_command(
+    src: Path | str, dst: Path | str, *, ffmpeg: str = "ffmpeg"
+) -> list[str]:
+    """Lossless stream-copy remux of ``src`` -> ``dst`` (rebuilds the header).
+
+    Pure/side-effect-free so it is unit-testable without spawning ffmpeg. This is
+    ``-c copy`` only: no re-encode, byte-identical A/V, just a freshly written
+    container index/header — the fix for a capture whose duration header was
+    never finalized (e.g. ffmpeg killed when the card filled). ``-y`` overwrites
+    the fixed-name sidecar on a re-run.
+    """
+    return [ffmpeg, "-v", "error", "-y", "-i", str(src), "-c", "copy", str(dst)]
+
+
+def resolve_capture_duration(
+    capture: Path,
+    session_dir: Path,
+    *,
+    ffprobe: str,
+    ffmpeg: str,
+    out: Callable[[str], object] = print,
+) -> tuple[Path, float]:
+    """Return ``(capture, duration)``, recovering a missing duration header once.
+
+    Healthy captures return unchanged with no remux. If the duration cannot be
+    read (probe raises, or is <= 0), attempt exactly ONE lossless ``-c copy``
+    remux to a sidecar in the session folder and re-probe it once:
+
+    * remux + re-probe yields a valid duration -> use the sidecar (original left
+      untouched) and print a recovery note;
+    * the remux command itself fails -> raise a clean EditError (no second probe);
+    * still unparseable after remux -> raise the current clean "Could not parse a
+      duration" EditError (terminal — no loop, no second remux).
+    """
+    try:
+        duration = probe_duration(capture, ffprobe=ffprobe)
+        if duration > 0:
+            return capture, duration
+    except EditError:
+        pass  # fall through to the one-time remux recovery below
+
+    sidecar = session_dir / f"{REMUX_SIDECAR_STEM}{capture.suffix}"
+    remux = run_ffmpeg_command(build_remux_command(capture, sidecar, ffmpeg=ffmpeg))
+    if remux.returncode != 0:
+        tail = "\n".join((remux.stderr or "").strip().splitlines()[-8:])
+        raise EditError(
+            f"{capture} has no readable duration and could not be remuxed to "
+            f"recover it:\n{tail}"
+        )
+
+    # Re-probe the remuxed file exactly once. If it still won't parse, surface
+    # the same clean error as before against the ORIGINAL capture (terminal).
+    try:
+        duration = probe_duration(sidecar, ffprobe=ffprobe)
+    except EditError:
+        duration = 0.0
+    if duration <= 0:
+        raise EditError(f"Could not parse a duration from {capture}.")
+
+    out(
+        f"{capture.name} had no readable duration (unfinalized header?) — remuxed "
+        f"losslessly to {sidecar.name} and using that. Original left untouched."
+    )
+    return sidecar, duration
+
+
 # --------------------------------------------------------------------------- #
 # Speech detection (silero-vad; optional [vad] extra, lazy import, mockable)
 # --------------------------------------------------------------------------- #
@@ -850,9 +921,11 @@ def run_edit(
         raise EditError(_FFPROBE_HINT)
 
     capture = find_capture(session_dir)
-    duration = probe_duration(capture, ffprobe=ffprobe)
-    if duration <= 0:
-        raise EditError(f"{capture} has no readable duration.")
+    # Recover a missing/invalid duration header (e.g. a capture left unfinalized
+    # when ffmpeg was killed) via a one-time lossless remux to a sidecar.
+    capture, duration = resolve_capture_duration(
+        capture, session_dir, ffprobe=ffprobe, ffmpeg=ffmpeg, out=out
+    )
     has_audio = probe_has_audio(capture, ffprobe=ffprobe)
 
     events = read_events(session_dir)

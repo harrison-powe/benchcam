@@ -816,3 +816,141 @@ def test_cli_edit_vad_dispatches(tmp_path, monkeypatch):
          "--session", str(session.folder), "--vad"]
     )
     assert code == 0
+
+
+# --------------------------------------------------------------------------- #
+# Lossless-remux recovery for a missing/invalid duration header
+# --------------------------------------------------------------------------- #
+
+def test_build_remux_command_is_lossless_stream_copy(tmp_path):
+    src = tmp_path / "capture.mkv"
+    dst = tmp_path / "capture.remuxed.mkv"
+    cmd = editor_mod.build_remux_command(src, dst, ffmpeg="/usr/bin/ffmpeg")
+
+    assert cmd[0] == "/usr/bin/ffmpeg"
+    assert cmd[cmd.index("-c") + 1] == "copy"  # stream copy, no re-encode
+    assert cmd[cmd.index("-i") + 1] == str(src)
+    assert cmd[-1] == str(dst)
+    # No encoder / re-encode flags may sneak in.
+    for flag in ("libx264", "-crf", "-preset", "-c:v", "-c:a", "-b:v"):
+        assert flag not in cmd
+
+
+def test_run_edit_remuxes_and_recovers_when_duration_unparseable(tmp_path, monkeypatch):
+    from benchcam import session as session_mod
+
+    root = tmp_path / "sessions"
+    session = session_mod.create_session(root=root)
+    original = session.folder / "capture.mkv"
+    original.write_bytes(b"broken-header")  # unfinalized capture
+    sidecar = session.folder / "capture.remuxed.mkv"
+
+    monkeypatch.setattr(editor_mod.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    # Duration is unreadable from the original but fine once remuxed.
+    def fake_probe(path, **k):
+        if Path(path) == sidecar:
+            return 42.0
+        raise EditError(f"Could not parse a duration from {path}.")
+
+    monkeypatch.setattr(editor_mod, "probe_duration", fake_probe)
+    monkeypatch.setattr(editor_mod, "probe_has_audio", lambda *a, **k: False)
+
+    runs: list[list[str]] = []
+
+    def fake_run(cmd):
+        runs.append(cmd)
+        if "-filter_complex_script" not in cmd:  # the remux — write the sidecar
+            Path(cmd[-1]).write_bytes(b"remuxed")
+        return mock.Mock(returncode=0, stderr="")
+
+    monkeypatch.setattr(editor_mod, "run_ffmpeg_command", fake_run)
+
+    messages: list[str] = []
+    output = editor_mod.run_edit(session.folder, out=messages.append)
+
+    assert output == session.folder / "review.mp4"
+    # A lossless remux to the sidecar happened...
+    remux = next(c for c in runs if "-filter_complex_script" not in c)
+    assert remux[remux.index("-c") + 1] == "copy"
+    assert remux[-1] == str(sidecar)
+    # ...and the render read the RECOVERED sidecar, not the broken original.
+    render = next(c for c in runs if "-filter_complex_script" in c)
+    assert render[render.index("-i") + 1] == str(sidecar)
+    # Recovery note printed; the original capture is left untouched.
+    assert any("remuxed" in m.lower() for m in messages)
+    assert original.exists()
+
+
+def test_run_edit_fails_cleanly_when_duration_still_unparseable_after_remux(
+    tmp_path, monkeypatch
+):
+    from benchcam import session as session_mod
+
+    root = tmp_path / "sessions"
+    session = session_mod.create_session(root=root)
+    (session.folder / "capture.mkv").write_bytes(b"broken")
+
+    monkeypatch.setattr(editor_mod.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    probe_calls: list[Path] = []
+
+    def fake_probe(path, **k):
+        probe_calls.append(Path(path))
+        raise EditError(f"Could not parse a duration from {path}.")
+
+    monkeypatch.setattr(editor_mod, "probe_duration", fake_probe)
+    monkeypatch.setattr(editor_mod, "probe_has_audio", lambda *a, **k: False)
+
+    runs: list[list[str]] = []
+
+    def fake_run(cmd):
+        runs.append(cmd)
+        Path(cmd[-1]).write_bytes(b"remuxed")  # remux "succeeds"...
+        return mock.Mock(returncode=0, stderr="")
+
+    monkeypatch.setattr(editor_mod, "run_ffmpeg_command", fake_run)
+
+    with pytest.raises(EditError) as exc:
+        editor_mod.run_edit(session.folder, out=lambda _m: None)
+
+    assert "could not parse a duration" in str(exc.value).lower()
+    assert len(probe_calls) == 2  # original + remuxed exactly once — no loop
+    assert len(runs) == 1  # exactly one remux; the render never ran
+    assert not any("-filter_complex_script" in c for c in runs)
+
+
+def test_run_edit_fails_when_remux_command_fails(tmp_path, monkeypatch):
+    from benchcam import session as session_mod
+
+    root = tmp_path / "sessions"
+    session = session_mod.create_session(root=root)
+    (session.folder / "capture.mkv").write_bytes(b"broken")
+
+    monkeypatch.setattr(editor_mod.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    probe_calls: list[Path] = []
+
+    def fake_probe(path, **k):
+        probe_calls.append(Path(path))
+        raise EditError(f"Could not parse a duration from {path}.")
+
+    monkeypatch.setattr(editor_mod, "probe_duration", fake_probe)
+    monkeypatch.setattr(editor_mod, "probe_has_audio", lambda *a, **k: False)
+
+    runs: list[list[str]] = []
+
+    def fake_run(cmd):
+        runs.append(cmd)
+        return mock.Mock(returncode=1, stderr="remux boom: invalid data found")
+
+    monkeypatch.setattr(editor_mod, "run_ffmpeg_command", fake_run)
+
+    with pytest.raises(EditError) as exc:
+        editor_mod.run_edit(session.folder, out=lambda _m: None)
+
+    assert "could not be remuxed" in str(exc.value).lower()
+    assert "remux boom" in str(exc.value)  # stderr tail surfaced
+    assert len(probe_calls) == 1  # no second probe after a failed remux
+    assert len(runs) == 1  # only the remux; the render never ran
+    assert not any("-filter_complex_script" in c for c in runs)
