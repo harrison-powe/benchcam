@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -222,8 +223,19 @@ def get_active_session(root: Path = DEFAULT_SESSIONS_ROOT) -> Session:
     folder_name = pointer.read_text(encoding="utf-8").strip()
     folder = root / folder_name
     if not folder.exists():
+        # Self-heal a dangling pointer (folder deleted out from under it) instead
+        # of wedging every command with a dead-end refusal. Clear the stale
+        # pointer, leave a one-line trace (stderr, so it also lands in journalctl
+        # for the physical-button/daemon path), and report "no active session" —
+        # exactly as if nothing were active, so the next 'new'/START just works.
+        pointer.unlink(missing_ok=True)
+        print(
+            f"benchcam: cleared a stale active-session pointer "
+            f"({folder_name or folder} no longer exists).",
+            file=sys.stderr,
+        )
         raise SessionError(
-            f"Active session points to {folder}, but that folder is missing."
+            "No active session. Create one with 'benchcam new' first."
         )
     return load_session(folder)
 

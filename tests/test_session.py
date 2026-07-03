@@ -65,6 +65,62 @@ def test_get_active_without_session_raises(tmp_path):
         session_mod.get_active_session(root)
 
 
+def test_stale_active_pointer_self_heals_to_no_active(tmp_path, capsys):
+    # A dangling .active (folder deleted out from under it) must NOT wedge with
+    # the "folder is missing" refusal: it self-heals to "no active session",
+    # clears the pointer, and warns on stderr (so it lands in journalctl too).
+    import shutil
+
+    root = tmp_path / "sessions"
+    created = session_mod.create_session(root=root)  # writes .active
+    pointer = session_mod._active_pointer(root)
+    assert pointer.exists()
+    shutil.rmtree(created.folder)  # the wedge condition
+
+    with pytest.raises(SessionError) as exc:
+        session_mod.get_active_session(root)
+
+    # Standard "no active" message, NOT the dead-end "folder is missing" wedge.
+    assert "No active session" in str(exc.value)
+    assert "folder is missing" not in str(exc.value)
+    # Pointer cleared (self-healed) and the id is named in a stderr warning.
+    assert not pointer.exists()
+    err = capsys.readouterr().err
+    assert "stale active-session pointer" in err
+    assert created.session_id in err
+
+
+def test_stale_pointer_allows_starting_a_fresh_session(tmp_path):
+    # After a self-heal, creating a new session must resolve normally — proving
+    # the pointer is unwedged and the bench workflow (new / physical START) works.
+    import shutil
+
+    root = tmp_path / "sessions"
+    old = session_mod.create_session(root=root)
+    shutil.rmtree(old.folder)
+    with pytest.raises(SessionError):
+        session_mod.get_active_session(root)  # heals the stale pointer
+
+    fresh = session_mod.create_session(root=root)  # sets .active anew
+    active = session_mod.get_active_session(root)
+    assert active.session_id == fresh.session_id
+    assert active.folder.exists()  # resolves to a real, present session folder
+
+
+def test_valid_active_pointer_is_untouched(tmp_path):
+    # The normal path must behave exactly as today: folder exists -> returns the
+    # session and the pointer is left intact (no self-heal side effects).
+    root = tmp_path / "sessions"
+    created = session_mod.create_session(root=root)
+    pointer = session_mod._active_pointer(root)
+
+    active = session_mod.get_active_session(root)
+
+    assert active.session_id == created.session_id
+    assert pointer.exists()
+    assert pointer.read_text(encoding="utf-8").strip() == created.session_id
+
+
 def test_unique_folder_when_timestamp_collides(tmp_path, monkeypatch):
     root = tmp_path / "sessions"
 

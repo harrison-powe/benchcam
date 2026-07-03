@@ -144,3 +144,25 @@ def test_fetch_invokes_scp_with_remote_and_dest(tmp_path, monkeypatch):
         in argv
     )
     assert str(root) in argv
+
+
+def test_end_on_stale_active_pointer_no_ops_gracefully(tmp_path, capsys):
+    # A dangling .active must not wedge `benchcam end`: it reports "no active
+    # session" (exit 1, no traceback), warns that it cleared the stale pointer,
+    # and leaves the pointer gone so the next `new` works.
+    import shutil
+
+    root = str(tmp_path / "sessions")
+    assert main(["new", "--sessions-root", root]) == 0
+    active = session_mod.get_active_session(tmp_path / "sessions")
+    shutil.rmtree(active.folder)  # delete the folder out from under the pointer
+
+    rc = main(["end", "--sessions-root", root])
+
+    assert rc == 1  # nothing active -> clean non-zero, not a crash
+    err = capsys.readouterr().err
+    assert "No active session" in err               # the graceful message
+    assert "folder is missing" not in err           # not the old dead-end wedge
+    assert "stale active-session pointer" in err     # self-heal trace
+    assert "Traceback" not in err                    # did not crash
+    assert not session_mod._active_pointer(tmp_path / "sessions").exists()
