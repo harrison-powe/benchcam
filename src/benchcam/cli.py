@@ -26,6 +26,7 @@ import sys
 from pathlib import Path
 
 from . import __version__
+from . import autochapter as autochapter_mod
 from . import dashboard as dashboard_mod
 from . import editor as editor_mod
 from . import keypress
@@ -33,6 +34,7 @@ from . import label as label_mod
 from . import live as live_mod
 from . import session as session_mod
 from . import transcribe as transcribe_mod
+from .autochapter import AutochapterError
 from .dashboard import DashboardError
 from .editor import EditError
 from .label import LabelError
@@ -295,6 +297,62 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_label.set_defaults(func=cmd_label)
 
+    # autochapter
+    p_auto = sub.add_parser(
+        "autochapter",
+        help="Propose chapters from the FULL-session transcript and write them as "
+        "source=auto markers (laptop; needs [transcribe] + [label] and "
+        "$ANTHROPIC_API_KEY). Merges with existing markers; real presses win.",
+    )
+    _add_root_arg(p_auto)
+    p_auto.add_argument(
+        "--session",
+        default=None,
+        help="Session id or folder path (default: newest session).",
+    )
+    p_auto.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "Claude model for chapter proposal "
+            f"(default: $BENCHCAM_AUTOCHAPTER_MODEL or {autochapter_mod.DEFAULT_MODEL})."
+        ),
+    )
+    p_auto.add_argument(
+        "--whisper-model",
+        default=None,
+        help=(
+            "Whisper model for the full-session transcription "
+            f"(default: $BENCHCAM_WHISPER_MODEL or {transcribe_mod.DEFAULT_MODEL})."
+        ),
+    )
+    p_auto.add_argument(
+        "--language",
+        default=transcribe_mod.DEFAULT_LANGUAGE,
+        help="Language for Whisper (default: en; pass '' to auto-detect).",
+    )
+    p_auto.add_argument(
+        "--conflict-window",
+        type=float,
+        default=autochapter_mod.DEFAULT_CONFLICT_WINDOW,
+        help=(
+            "Drop an auto chapter within this many seconds of an existing marker "
+            "(real presses win) or another auto chapter (default: 20)."
+        ),
+    )
+    p_auto.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Re-run Whisper instead of using the cached transcript.json.",
+    )
+    p_auto.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Call the API and print proposed chapters without writing markers.csv "
+        "(still caches transcript.json).",
+    )
+    p_auto.set_defaults(func=cmd_autochapter)
+
     # dashboard
     p_dash = sub.add_parser(
         "dashboard",
@@ -476,6 +534,22 @@ def cmd_label(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_autochapter(args: argparse.Namespace) -> int:
+    session_dir = editor_mod.resolve_session_dir(
+        Path(args.sessions_root), args.session
+    )
+    autochapter_mod.run_autochapter(
+        session_dir,
+        model=args.model,
+        whisper_model=args.whisper_model,
+        language=args.language,
+        conflict_window=args.conflict_window,
+        overwrite=args.overwrite,
+        dry_run=args.dry_run,
+    )
+    return 0
+
+
 def cmd_dashboard(args: argparse.Namespace) -> int:
     # --lan is the explicit, deliberate way to expose on the LAN; it overrides
     # --host so a phone can reach the dashboard without remembering 0.0.0.0.
@@ -555,6 +629,7 @@ def main(argv: list[str] | None = None) -> int:
         DashboardError,
         TranscribeError,
         LabelError,
+        AutochapterError,
     ) as exc:
         print(f"benchcam: {exc}", file=sys.stderr)
         return 1
