@@ -33,6 +33,7 @@ from . import editor as editor_mod
 from . import keypress
 from . import label as label_mod
 from . import live as live_mod
+from . import publish as publish_mod
 from . import session as session_mod
 from . import transcribe as transcribe_mod
 from .autochapter import AutochapterError
@@ -40,6 +41,7 @@ from .chapters import ChaptersError
 from .dashboard import DashboardError
 from .editor import EditError
 from .label import LabelError
+from .publish import PublishError
 from .recorders import get_recorder
 from .recorders.base import RecorderError
 from .session import SessionError
@@ -406,6 +408,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_chap.set_defaults(func=cmd_chapters)
 
+    # publish
+    p_pub = sub.add_parser(
+        "publish",
+        help="Export a paste-ready YouTube chapter block (review timestamps) from a "
+        "rendered session to youtube_chapters.txt. Read-only; never uploads.",
+    )
+    _add_root_arg(p_pub)
+    p_pub.add_argument(
+        "session",
+        nargs="?",
+        default=None,
+        help="Session id or folder path (default: newest session).",
+    )
+    p_pub.set_defaults(func=cmd_publish)
+
     # dashboard
     p_dash = sub.add_parser(
         "dashboard",
@@ -631,6 +648,13 @@ def cmd_chapters(args: argparse.Namespace) -> int:
     )
 
 
+def cmd_publish(args: argparse.Namespace) -> int:
+    session_dir = editor_mod.resolve_session_dir(
+        Path(args.sessions_root), args.session
+    )
+    return publish_mod.run_publish(session_dir)
+
+
 def cmd_dashboard(args: argparse.Namespace) -> int:
     # --lan is the explicit, deliberate way to expose on the LAN; it overrides
     # --host so a phone can reach the dashboard without remembering 0.0.0.0.
@@ -712,6 +736,7 @@ def main(argv: list[str] | None = None) -> int:
         LabelError,
         AutochapterError,
         ChaptersError,
+        PublishError,
     ) as exc:
         print(f"benchcam: {exc}", file=sys.stderr)
         return 1
