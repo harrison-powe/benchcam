@@ -72,6 +72,23 @@ def _add_root_arg(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_pi_args(parser: argparse.ArgumentParser) -> None:
+    """Add the Pi SSH host / remote sessions root (shared by fetch and edit --fetch)."""
+    parser.add_argument(
+        "--host",
+        default="harrison@tatooine.local",
+        help="SSH host of the Pi (default: harrison@tatooine.local).",
+    )
+    parser.add_argument(
+        "--remote-root",
+        default="/home/harrison/benchcam/sessions",
+        help=(
+            "Absolute sessions root on the Pi "
+            "(default: /home/harrison/benchcam/sessions)."
+        ),
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="benchcam",
@@ -247,6 +264,14 @@ def build_parser() -> argparse.ArgumentParser:
         "quickly eyeballing chapter/title changes. Never overwrites review.mp4; "
         "same segment plan and timestamps as a full render.",
     )
+    p_edit.add_argument(
+        "--fetch",
+        action="store_true",
+        help="Pull the session from the Pi first if it's not already local "
+        "(reuses 'benchcam fetch'); requires --session. Skips the download when the "
+        "capture is already present, so re-running doesn't re-download.",
+    )
+    _add_pi_args(p_edit)
     p_edit.set_defaults(func=cmd_edit)
 
     # transcribe
@@ -468,19 +493,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_fetch.add_argument(
         "session", help="Session id to fetch, e.g. 2026-06-23_20-17-17."
     )
-    p_fetch.add_argument(
-        "--host",
-        default="harrison@tatooine.local",
-        help="SSH host of the Pi (default: harrison@tatooine.local).",
-    )
-    p_fetch.add_argument(
-        "--remote-root",
-        default="/home/harrison/benchcam/sessions",
-        help=(
-            "Absolute sessions root on the Pi "
-            "(default: /home/harrison/benchcam/sessions)."
-        ),
-    )
+    _add_pi_args(p_fetch)
     p_fetch.add_argument(
         "--no-open",
         action="store_true",
@@ -557,6 +570,25 @@ def cmd_live(args: argparse.Namespace) -> int:
 
 
 def cmd_edit(args: argparse.Namespace) -> int:
+    # --fetch: pull the session from the Pi first if it's not already local, then
+    # edit as normal. CLI-layer orchestration (like --auto), never in run_edit;
+    # reuses fetch's _transfer_session (no scp reimplementation) and deliberately
+    # does NOT run fetch's folder/VLC auto-open mid-pipeline.
+    if args.fetch:
+        if not args.session:
+            raise EditError(
+                "--fetch needs --session <id> (the session to pull from the Pi)."
+            )
+        if _is_local_with_capture(args.sessions_root, args.session):
+            print(f"--fetch: {args.session} already local; skipping download.")
+        elif _transfer_session(
+            args.session,
+            host=args.host,
+            remote_root=args.remote_root,
+            sessions_root=args.sessions_root,
+        ) is None:
+            return 1  # scp failed; message already printed by _transfer_session
+
     session_dir = editor_mod.resolve_session_dir(
         Path(args.sessions_root), args.session
     )
@@ -667,30 +699,67 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     )
 
 
-def cmd_fetch(args: argparse.Namespace) -> int:
-    # Runs on the laptop: the dashboard is served from a headless Pi, so its
-    # "Open video"/"Open folder" buttons can't reach the laptop's screen. Pull
-    # the session folder here over scp, then open it locally to watch/edit.
-    dest_root = Path(args.sessions_root)
-    dest_root.mkdir(parents=True, exist_ok=True)
+def _transfer_session(
+    session: str, *, host: str, remote_root: str, sessions_root: str | Path
+) -> Path | None:
+    """scp a session folder from the Pi into the local sessions root.
 
-    remote = f"{args.host}:{args.remote_root}/{args.session}"
+    The shared transfer used by both ``benchcam fetch`` and ``benchcam edit
+    --fetch``. Returns the local session directory on success, or ``None`` after
+    printing the scp-failure message (the caller decides the exit path). It does
+    NOT open anything — the folder/VLC auto-open is a standalone-``fetch``
+    convenience layered on top in :func:`cmd_fetch`, deliberately kept out of the
+    edit pipeline.
+    """
+    dest_root = Path(sessions_root)
+    dest_root.mkdir(parents=True, exist_ok=True)
+    remote = f"{host}:{remote_root}/{session}"
     try:
         # Windows 10/11 ships OpenSSH scp on PATH.
         subprocess.run(["scp", "-r", remote, str(dest_root)], check=True)
     except subprocess.CalledProcessError:
-        print(
-            f"scp failed — check the session id and that {args.host} is reachable"
-        )
-        return 1
+        print(f"scp failed — check the session id and that {host} is reachable")
+        return None
+    dest_dir = dest_root / session
+    print(f"Fetched {session} -> {dest_dir.resolve()}")
+    return dest_dir
 
-    dest_dir = dest_root / args.session
-    capture = dest_dir / "capture.mkv"
-    print(f"Fetched {args.session} -> {dest_dir.resolve()}")
+
+def _is_local_with_capture(sessions_root: str | Path, session: str | None) -> bool:
+    """True if the session is already on this laptop AND has a capture file.
+
+    Uses edit's own resolvers: the folder must resolve and contain a capture
+    (capture.mkv/.mp4/... or the OBS pointer). A missing folder — or a folder with
+    no capture — counts as not-local, so ``edit --fetch`` pulls it.
+    """
+    try:
+        session_dir = editor_mod.resolve_session_dir(Path(sessions_root), session)
+    except EditError:
+        return False
+    try:
+        editor_mod.find_capture(session_dir)
+        return True
+    except EditError:
+        return False
+
+
+def cmd_fetch(args: argparse.Namespace) -> int:
+    # Runs on the laptop: the dashboard is served from a headless Pi, so its
+    # "Open video"/"Open folder" buttons can't reach the laptop's screen. Pull
+    # the session folder here over scp, then open it locally to watch/edit.
+    dest_dir = _transfer_session(
+        args.session,
+        host=args.host,
+        remote_root=args.remote_root,
+        sessions_root=args.sessions_root,
+    )
+    if dest_dir is None:
+        return 1
 
     if args.no_open:
         return 0
 
+    capture = dest_dir / "capture.mkv"
     # Best-effort opening: a failure here must never fail the command now that
     # the copy succeeded — warn and keep going.
     if os.name == "nt":

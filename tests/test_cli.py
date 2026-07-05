@@ -303,6 +303,116 @@ def test_edit_overwrite_auto_preserves_gpio_and_manual_markers(tmp_path, monkeyp
     assert sorted(auto_labels) == ["Stiffness Test", "Velocity Sweep"]
 
 
+# --------------------------------------------------------------------------- #
+# edit --fetch: pull-if-missing prefix step to the render
+# --------------------------------------------------------------------------- #
+
+_FETCH_SID = "2026-07-05_10-00-00"
+
+
+def _fake_scp_creates_session(root, sid, recorder):
+    """A subprocess.run stand-in that simulates 'scp -r' pulling the session."""
+    def fake_run(argv, *args, **kwargs):
+        recorder.append(argv)
+        d = root / sid
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "session.json").write_text("{}", encoding="utf-8")
+        (d / "capture.mkv").write_bytes(b"v")
+        return argparse.Namespace(returncode=0)
+    return fake_run
+
+
+def _stub_render(monkeypatch, sink):
+    def fake_render(session_dir, **kwargs):
+        sink.append(Path(session_dir))
+        return Path(session_dir) / "review.mp4"
+    monkeypatch.setattr(editor_mod, "run_edit", fake_render)
+
+
+def test_edit_fetch_pulls_when_missing_then_edits(tmp_path, monkeypatch):
+    root = tmp_path / "sessions"
+    scp, rendered, opened = [], [], []
+    monkeypatch.setattr(cli_mod.subprocess, "run", _fake_scp_creates_session(root, _FETCH_SID, scp))
+    monkeypatch.setattr(cli_mod.os, "startfile", lambda *a, **k: opened.append(a), raising=False)
+    _stub_render(monkeypatch, rendered)
+
+    rc = main(["edit", "--sessions-root", str(root), "--session", _FETCH_SID, "--fetch"])
+
+    assert rc == 0
+    # scp pulled the right remote into the local sessions root...
+    assert len(scp) == 1
+    argv = scp[0]
+    assert argv[0] == "scp" and argv[1] == "-r"
+    assert f"harrison@tatooine.local:/home/harrison/benchcam/sessions/{_FETCH_SID}" in argv
+    assert str(root) in argv
+    # ...then edited the fetched session.
+    assert rendered == [root / _FETCH_SID]
+    # The standalone fetch folder/VLC auto-open must NOT fire mid-pipeline.
+    assert opened == []
+
+
+def test_edit_fetch_skips_when_already_local(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "sessions"
+    d = root / _FETCH_SID
+    d.mkdir(parents=True)
+    (d / "session.json").write_text("{}", encoding="utf-8")
+    (d / "capture.mkv").write_bytes(b"v")  # capture present -> already local
+
+    scp, rendered = [], []
+    monkeypatch.setattr(cli_mod.subprocess, "run", lambda *a, **k: scp.append(a) or argparse.Namespace(returncode=0))
+    _stub_render(monkeypatch, rendered)
+
+    rc = main(["edit", "--sessions-root", str(root), "--session", _FETCH_SID, "--fetch"])
+
+    assert rc == 0
+    assert scp == []  # no download
+    assert rendered == [d]
+    assert "already local" in capsys.readouterr().out
+
+
+def test_edit_fetch_composes_with_auto(tmp_path, monkeypatch):
+    root = tmp_path / "sessions"
+    scp, auto, rendered = [], [], []
+    monkeypatch.setattr(cli_mod.subprocess, "run", _fake_scp_creates_session(root, _FETCH_SID, scp))
+    monkeypatch.setattr(cli_mod.os, "startfile", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(autochapter_mod, "run_autochapter", lambda sd, **k: auto.append(Path(sd)))
+    _stub_render(monkeypatch, rendered)
+
+    rc = main([
+        "edit", "--sessions-root", str(root), "--session", _FETCH_SID, "--fetch", "--auto",
+    ])
+
+    assert rc == 0
+    assert len(scp) == 1  # fetched first
+    assert auto == [root / _FETCH_SID]  # then autochapter ran
+    assert rendered == [root / _FETCH_SID]  # then rendered
+
+
+def test_edit_fetch_requires_session(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "sessions"
+    scp = []
+    monkeypatch.setattr(cli_mod.subprocess, "run", lambda *a, **k: scp.append(a) or argparse.Namespace(returncode=0))
+
+    rc = main(["edit", "--sessions-root", str(root), "--fetch"])  # no --session
+
+    assert rc == 1
+    assert scp == []  # never attempted a transfer
+    err = capsys.readouterr().err
+    assert "--fetch" in err and "--session" in err
+
+
+def test_plain_edit_without_fetch_still_requires_local(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "sessions"
+    scp = []
+    monkeypatch.setattr(cli_mod.subprocess, "run", lambda *a, **k: scp.append(a) or argparse.Namespace(returncode=0))
+
+    rc = main(["edit", "--sessions-root", str(root), "--session", "2026-missing"])
+
+    assert rc == 1  # errors as today when the session isn't local
+    assert scp == []  # plain edit never fetches
+    assert "not found" in capsys.readouterr().err.lower()
+
+
 def test_end_on_stale_active_pointer_no_ops_gracefully(tmp_path, capsys):
     # A dangling .active must not wedge `benchcam end`: it reports "no active
     # session" (exit 1, no traceback), warns that it cleared the stale pointer,
