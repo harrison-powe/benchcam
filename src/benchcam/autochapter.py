@@ -385,6 +385,17 @@ def _is_auto(source: str | None) -> bool:
     return AUTO_SOURCE in [tag for tag in (source or "").split("+") if tag]
 
 
+def has_auto_markers(session_dir: Path | str) -> bool:
+    """True if markers.csv already holds >=1 ``source=auto`` chapter.
+
+    The skip gate for ``edit --auto``: when auto chapters already exist, the
+    orchestrator renders straight from them (no Whisper, no API) unless
+    ``--overwrite-auto`` forces regeneration.
+    """
+    rows = read_markers(Path(session_dir) / MARKERS_FILENAME)
+    return any(_is_auto(row.get("source")) for row in rows)
+
+
 @dataclass(frozen=True)
 class MergePlan:
     """The file rewrite: existing rows to keep, plus new auto chapters to add."""

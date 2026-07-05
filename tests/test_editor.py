@@ -954,3 +954,93 @@ def test_run_edit_fails_when_remux_command_fails(tmp_path, monkeypatch):
     assert len(probe_calls) == 1  # no second probe after a failed remux
     assert len(runs) == 1  # only the remux; the render never ran
     assert not any("-filter_complex_script" in c for c in runs)
+
+
+# --------------------------------------------------------------------------- #
+# --preview: encode-only fast render (separate file, identical plan)
+# --------------------------------------------------------------------------- #
+
+def test_build_ffmpeg_edit_command_preview_and_default_settings(tmp_path):
+    src, out, script = tmp_path / "c.mp4", tmp_path / "o.mp4", tmp_path / "g.ff"
+    default = editor_mod.build_ffmpeg_edit_command(src, out, script)
+    assert default[default.index("-preset") + 1] == "veryfast"
+    assert default[default.index("-crf") + 1] == "20"
+    prev = editor_mod.build_ffmpeg_edit_command(
+        src, out, script, preset="ultrafast", crf=30
+    )
+    assert prev[prev.index("-preset") + 1] == "ultrafast"
+    assert prev[prev.index("-crf") + 1] == "30"
+
+
+def test_build_filter_complex_preview_scale_is_additive():
+    # The preview graph must be the plain graph with the concat's video pad
+    # relabeled + one trailing uniform scale — proving no trim/setpts/caption
+    # (i.e. no timestamp) changes, only a resolution stage on the composited frame.
+    plan = editor_mod.build_segment_plan([(10.0, "First")], 30.0)
+    plain = editor_mod.build_filter_complex(plan, has_audio=True)
+    prev = editor_mod.build_filter_complex(plan, has_audio=True, scale_height=720)
+
+    assert "scale=" not in plain  # non-preview graph is untouched
+    assert prev == (
+        plain.replace("[outv][outa]", "[vcat][outa]")
+        + ";[vcat]scale=-2:720:flags=fast_bilinear[outv]"
+    )
+    # Every stage before the concat (all the trims/setpts/drawtexts) is identical.
+    assert plain.split(";")[:-1] == prev.split(";")[:-2]
+
+
+def _edit_render_session(tmp_path, monkeypatch):
+    from benchcam import session as session_mod
+
+    root = tmp_path / "sessions"
+    session = session_mod.create_session(root=root)
+    (session.folder / "capture.mp4").write_bytes(b"video")
+    session_mod.start_session(session)
+    session_mod.add_marker(session, "power on")
+
+    monkeypatch.setattr(editor_mod.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(editor_mod, "probe_duration", lambda *a, **k: 60.0)
+    monkeypatch.setattr(editor_mod, "probe_has_audio", lambda *a, **k: True)
+
+    captured = {}
+
+    def fake_run(cmd):
+        captured["cmd"] = cmd
+        script = cmd[cmd.index("-filter_complex_script") + 1]
+        captured["graph"] = Path(script).read_text(encoding="utf-8")
+        return mock.Mock(returncode=0, stderr="")
+
+    monkeypatch.setattr(editor_mod, "run_ffmpeg_command", fake_run)
+    return session, captured
+
+
+def test_run_edit_plain_render_is_unchanged(tmp_path, monkeypatch):
+    session, captured = _edit_render_session(tmp_path, monkeypatch)
+
+    output = editor_mod.run_edit(session.folder, out=lambda _m: None)
+    cmd = captured["cmd"]
+
+    assert output == session.folder / "review.mp4"
+    assert cmd[-1].endswith("review.mp4") and not cmd[-1].endswith("preview.mp4")
+    assert cmd[cmd.index("-preset") + 1] == "veryfast"
+    assert cmd[cmd.index("-crf") + 1] == "20"
+    assert "scale=" not in captured["graph"]
+
+
+def test_run_edit_preview_writes_separate_file_and_leaves_review_untouched(
+    tmp_path, monkeypatch
+):
+    session, captured = _edit_render_session(tmp_path, monkeypatch)
+    # A real review.mp4 already exists; preview must never target or touch it.
+    (session.folder / "review.mp4").write_bytes(b"REAL-REVIEW")
+
+    output = editor_mod.run_edit(session.folder, preview=True, out=lambda _m: None)
+    cmd = captured["cmd"]
+
+    assert output == session.folder / "review.preview.mp4"
+    assert cmd[-1].endswith("review.preview.mp4")  # ffmpeg target is the sidecar
+    assert cmd[cmd.index("-preset") + 1] == "ultrafast"
+    assert cmd[cmd.index("-crf") + 1] == "30"
+    assert "scale=-2:720" in captured["graph"]
+    # The real review.mp4 is left byte-for-byte alone.
+    assert (session.folder / "review.mp4").read_bytes() == b"REAL-REVIEW"

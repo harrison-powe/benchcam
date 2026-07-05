@@ -220,6 +220,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Silero speech probability threshold, 0-1; higher = stricter "
         "(default: 0.5). --vad only.",
     )
+    p_edit.add_argument(
+        "--auto",
+        action="store_true",
+        help="Run the full pipeline before rendering: full-session transcribe "
+        "(if no cached transcript.json) + autochapter (if no source=auto markers "
+        "yet), then render. Each expensive step is skipped if its output already "
+        "exists, so a re-render after editing a title skips straight to render. "
+        "Needs the [transcribe] + [label] extras and $ANTHROPIC_API_KEY.",
+    )
+    p_edit.add_argument(
+        "--overwrite-auto",
+        action="store_true",
+        help="With --auto, force the pipeline to re-run (fresh transcription and "
+        "chapters), replacing prior source=auto markers. Real gpio/manual markers "
+        "are always preserved.",
+    )
+    p_edit.add_argument(
+        "--preview",
+        action="store_true",
+        help="Fast, low-quality render (720p, ultrafast) to review.preview.mp4 for "
+        "quickly eyeballing chapter/title changes. Never overwrites review.mp4; "
+        "same segment plan and timestamps as a full render.",
+    )
     p_edit.set_defaults(func=cmd_edit)
 
     # transcribe
@@ -490,6 +513,24 @@ def cmd_edit(args: argparse.Namespace) -> int:
     session_dir = editor_mod.resolve_session_dir(
         Path(args.sessions_root), args.session
     )
+    # --auto: thin orchestration BEFORE the render (kept here, not in run_edit, so
+    # editor never imports autochapter — autochapter already imports editor). Each
+    # expensive step is skipped when its output exists: autochapter is skipped
+    # whole when source=auto chapters already exist (a title edit keeps them, so a
+    # re-render skips transcribe+API), and when it does run it reuses transcript.json
+    # unless --overwrite-auto. Freshly-written chapters are picked up by the render
+    # below because run_edit re-reads markers.csv.
+    if args.auto:
+        if args.overwrite_auto or not autochapter_mod.has_auto_markers(session_dir):
+            autochapter_mod.run_autochapter(
+                session_dir, overwrite=args.overwrite_auto
+            )
+        else:
+            print(
+                "--auto: source=auto chapters already present; skipping "
+                "transcribe + autochapter (use --overwrite-auto to regenerate). "
+                "Rendering from existing markers."
+            )
     output = editor_mod.run_edit(
         session_dir,
         pre=args.pre,
@@ -502,6 +543,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
         merge_gap=args.merge_gap,
         min_lapse=args.min_lapse,
         vad_threshold=args.vad_threshold,
+        preview=args.preview,
     )
     print(f"Wrote {output}")
     return 0

@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
+from benchcam import autochapter as autochapter_mod
 from benchcam import cli as cli_mod
 from benchcam import dashboard as dashboard_mod
+from benchcam import editor as editor_mod
 from benchcam import session as session_mod
 from benchcam.cli import cmd_fetch, main
-from benchcam.markers import read_markers
+from benchcam.markers import Marker, append_marker, read_markers
+from benchcam.transcribe import TranscriptSegment as TS
 
 
 def test_full_cli_flow(tmp_path, capsys):
@@ -144,6 +148,159 @@ def test_fetch_invokes_scp_with_remote_and_dest(tmp_path, monkeypatch):
         in argv
     )
     assert str(root) in argv
+
+
+# --------------------------------------------------------------------------- #
+# edit --auto orchestration (transcribe + autochapter, skip-if-cached) & --preview
+# --------------------------------------------------------------------------- #
+
+# Two transcript segments and a Claude payload that cites them verbatim, so the
+# validated chapters land at 10s and 300s (far from the real markers seeded below).
+_SEGS = [
+    TS(10, 15, "okay starting the stiffness test now"),
+    TS(300, 306, "and now the velocity sweep is running"),
+]
+_PAYLOAD = (
+    '[{"segment": 0, "quote": "starting the stiffness test", "at_seconds": 10, '
+    '"title": "Stiffness Test"},'
+    ' {"segment": 1, "quote": "velocity sweep is running", "at_seconds": 300, '
+    '"title": "Velocity Sweep"}]'
+)
+
+
+class _Block:
+    def __init__(self, text):
+        self.type = "text"
+        self.text = text
+
+
+class _Resp:
+    def __init__(self, text):
+        self.content = [_Block(text)]
+
+
+def _mock_auto_pipeline(monkeypatch):
+    """Mock Whisper + the Anthropic client on autochapter, and stub the render.
+
+    Returns a call counter so tests can assert which expensive steps ran.
+    """
+    calls = {"transcribe": 0, "api": 0, "render": 0}
+
+    def fake_transcribe(capture, model, *, language="en"):
+        calls["transcribe"] += 1
+        return _SEGS
+
+    class _Msgs:
+        def create(self, **kwargs):
+            calls["api"] += 1
+            return _Resp(_PAYLOAD)
+
+    class _Client:
+        messages = _Msgs()
+
+    monkeypatch.setattr(autochapter_mod, "transcribe_audio", fake_transcribe)
+    monkeypatch.setattr(autochapter_mod, "probe_has_audio", lambda *a, **k: True)
+    monkeypatch.setattr(autochapter_mod, "find_capture", lambda d: Path(d) / "capture.mkv")
+    monkeypatch.setattr(autochapter_mod.shutil, "which", lambda _n: "/usr/bin/x")
+    monkeypatch.setattr(autochapter_mod, "make_client", lambda: _Client())
+
+    def fake_render(session_dir, **kwargs):
+        calls["render"] += 1
+        return Path(session_dir) / "review.mp4"
+
+    monkeypatch.setattr(editor_mod, "run_edit", fake_render)
+    return calls
+
+
+def test_edit_auto_skips_transcribe_when_transcript_exists(tmp_path, monkeypatch):
+    root = tmp_path / "sessions"
+    session = session_mod.create_session(root=root)
+    (session.folder / "capture.mkv").write_bytes(b"video")
+    # A cached transcript exists; no source=auto markers yet.
+    autochapter_mod.save_transcript(session.folder, _SEGS, model="small", language="en")
+
+    calls = _mock_auto_pipeline(monkeypatch)
+    rc = main(["edit", "--sessions-root", str(root), "--session", session.session_id, "--auto"])
+
+    assert rc == 0
+    assert calls["transcribe"] == 0  # transcript.json reused -> no Whisper
+    assert calls["api"] == 1  # autochapter still proposed chapters
+    assert calls["render"] == 1  # then rendered
+    auto = [r for r in read_markers(session.markers_file) if r["source"] == "auto"]
+    assert [r["label"] for r in auto] == ["Stiffness Test", "Velocity Sweep"]
+
+
+def test_edit_auto_skips_autochapter_when_auto_markers_exist(tmp_path, monkeypatch):
+    root = tmp_path / "sessions"
+    session = session_mod.create_session(root=root)
+    (session.folder / "capture.mkv").write_bytes(b"video")
+    # A prior source=auto chapter already exists (as after a first --auto run, or a
+    # title edit that keeps the source=auto cell).
+    append_marker(session.markers_file, Marker(1, 42.0, "", "auto", "Prior Chapter"))
+
+    calls = _mock_auto_pipeline(monkeypatch)
+    rc = main(["edit", "--sessions-root", str(root), "--session", session.session_id, "--auto"])
+
+    assert rc == 0
+    assert calls["transcribe"] == 0  # autochapter skipped whole...
+    assert calls["api"] == 0  # ...no Whisper AND no API call
+    assert calls["render"] == 1  # straight to render
+    # The existing auto chapter is untouched (not regenerated).
+    auto = [r for r in read_markers(session.markers_file) if r["source"] == "auto"]
+    assert [r["label"] for r in auto] == ["Prior Chapter"]
+
+
+def test_edit_auto_runs_both_when_neither_exists(tmp_path, monkeypatch):
+    root = tmp_path / "sessions"
+    session = session_mod.create_session(root=root)
+    (session.folder / "capture.mkv").write_bytes(b"video")
+    # Neither a cached transcript nor any source=auto markers.
+
+    calls = _mock_auto_pipeline(monkeypatch)
+    rc = main(["edit", "--sessions-root", str(root), "--session", session.session_id, "--auto"])
+
+    assert rc == 0
+    assert calls["transcribe"] == 1  # full-session transcription ran...
+    assert calls["api"] == 1  # ...and chapters were proposed
+    assert calls["render"] == 1
+    assert autochapter_mod.transcript_path(session.folder).exists()  # cached
+    auto = [r for r in read_markers(session.markers_file) if r["source"] == "auto"]
+    assert [r["label"] for r in auto] == ["Stiffness Test", "Velocity Sweep"]
+
+
+def test_edit_overwrite_auto_preserves_gpio_and_manual_markers(tmp_path, monkeypatch):
+    # --overwrite-auto is the one path that re-triggers regeneration from inside
+    # edit: it must replace ONLY prior source=auto rows and never touch a real
+    # button-press (gpio) or hand-placed (manual) marker.
+    root = tmp_path / "sessions"
+    session = session_mod.create_session(root=root)
+    (session.folder / "capture.mkv").write_bytes(b"video")
+    append_marker(session.markers_file, Marker(1, 1000.0, "w1", "gpio", "Button Press"))
+    append_marker(session.markers_file, Marker(2, 2000.0, "w2", "manual", "Hand Note"))
+    append_marker(session.markers_file, Marker(3, 500.0, "", "auto", "Stale Auto"))
+
+    calls = _mock_auto_pipeline(monkeypatch)
+    rc = main([
+        "edit", "--sessions-root", str(root), "--session", session.session_id,
+        "--auto", "--overwrite-auto",
+    ])
+
+    assert rc == 0
+    assert calls["transcribe"] == 1  # regeneration forced despite existing auto rows
+    rows = read_markers(session.markers_file)
+    by_source = {r["source"]: r for r in rows}
+
+    # Real markers preserved verbatim: same time, label, source — none deleted.
+    gpio = next(r for r in rows if r["source"] == "gpio")
+    manual = next(r for r in rows if r["source"] == "manual")
+    assert gpio["label"] == "Button Press" and gpio["elapsed_seconds"] == "1000.000"
+    assert manual["label"] == "Hand Note" and manual["elapsed_seconds"] == "2000.000"
+
+    # Prior auto row replaced (not merely appended to): the stale one is gone,
+    # the freshly proposed chapters are present, all still source=auto.
+    auto_labels = [r["label"] for r in rows if r["source"] == "auto"]
+    assert "Stale Auto" not in auto_labels
+    assert sorted(auto_labels) == ["Stiffness Test", "Velocity Sweep"]
 
 
 def test_end_on_stale_active_pointer_no_ops_gracefully(tmp_path, capsys):

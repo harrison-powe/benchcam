@@ -34,7 +34,22 @@ from .markers import read_markers
 from .session import MARKERS_FILENAME, SESSION_FILENAME
 
 OUTPUT_FILENAME = "review.mp4"
+#: Fast, low-quality render written by ``edit --preview`` — a distinct filename so
+#: it never overwrites the real review.mp4.
+PREVIEW_OUTPUT_FILENAME = "review.preview.mp4"
 OBS_POINTER_FILENAME = "obs_recording.txt"
+
+#: Full-render encode settings (unchanged default).
+DEFAULT_PRESET = "veryfast"
+DEFAULT_CRF = 20
+#: Preview encode settings: ultrafast x264 + a lower quality + a 720p downscale,
+#: the biggest honest wall-clock win that still leaves the on-screen chapter tags
+#: readable. Only the encode/resolution differ from a full render — the segment
+#: plan, timestamps and captions are identical (the scale is a uniform trailing
+#: stage applied to the already-composited frame).
+PREVIEW_PRESET = "ultrafast"
+PREVIEW_CRF = 30
+PREVIEW_SCALE_HEIGHT = 720
 
 DEFAULT_PRE = 3.0
 DEFAULT_POST = 5.0
@@ -509,6 +524,7 @@ def build_filter_complex(
     *,
     fontfile: str | None = None,
     has_audio: bool = True,
+    scale_height: int | None = None,
 ) -> str:
     """Build the filtergraph string for the review clip (pure, testable).
 
@@ -517,6 +533,11 @@ def build_filter_complex(
     matching audio stream. Every audio segment ends with an explicit
     ``aformat`` (see ``_AUDIO_SEGMENT_FORMAT``) so ``concat`` never collapses the
     narration to the filler's 8-bit format.
+
+    ``scale_height`` (used only by ``edit --preview``) appends a single uniform
+    downscale to the *already-composited* output — after every trim/setpts/caption
+    stage — so it changes resolution only, never a timestamp or the plan. When it
+    is ``None`` (every non-preview render) the graph is byte-for-byte unchanged.
     """
     if not plan:
         raise EditError("Cannot build a filtergraph from an empty segment plan.")
@@ -551,8 +572,15 @@ def build_filter_complex(
 
         concat_inputs.append(f"[v{k}][a{k}]")
 
-    concat = "".join(concat_inputs) + f"concat=n={len(plan)}:v=1:a=1[outv][outa]"
-    return ";".join(chains + [concat])
+    # Preview appends a trailing uniform downscale, so the concat feeds an
+    # intermediate [vcat] pad that the scale stage renames to [outv]. Without a
+    # scale, the concat writes [outv] directly (byte-identical to before).
+    video_out = "vcat" if scale_height else "outv"
+    concat = "".join(concat_inputs) + f"concat=n={len(plan)}:v=1:a=1[{video_out}][outa]"
+    stages = chains + [concat]
+    if scale_height:
+        stages.append(f"[vcat]scale=-2:{scale_height}:flags=fast_bilinear[outv]")
+    return ";".join(stages)
 
 
 def build_ffmpeg_edit_command(
@@ -561,12 +589,16 @@ def build_ffmpeg_edit_command(
     filter_script_path: Path | str,
     *,
     ffmpeg: str = "ffmpeg",
+    preset: str = DEFAULT_PRESET,
+    crf: int = DEFAULT_CRF,
 ) -> list[str]:
     """Build the ffmpeg argv that renders the review clip from a filterscript.
 
     The filtergraph is read from ``filter_script_path`` via
     ``-filter_complex_script`` rather than inline, which sidesteps command-line
-    length limits and shell-escaping pain for long graphs.
+    length limits and shell-escaping pain for long graphs. ``preset``/``crf`` are
+    the only encode knobs ``edit --preview`` changes; their defaults reproduce the
+    full-render argv exactly.
     """
     return [
         ffmpeg,
@@ -587,9 +619,9 @@ def build_ffmpeg_edit_command(
         "-c:v",
         "libx264",
         "-preset",
-        "veryfast",
+        preset,
         "-crf",
-        "20",
+        str(crf),
         "-pix_fmt",
         "yuv420p",
         "-c:a",
@@ -897,15 +929,21 @@ def run_edit(
     merge_gap: float = DEFAULT_MERGE_GAP,
     min_lapse: float = DEFAULT_MIN_LAPSE,
     vad_threshold: float = DEFAULT_VAD_THRESHOLD,
+    preview: bool = False,
     ffmpeg: str | None = None,
     ffprobe: str | None = None,
     out: Callable[[str], object] = print,
 ) -> Path:
-    """Render ``review.mp4`` for ``session_dir`` and return its path.
+    """Render the review clip for ``session_dir`` and return its path.
 
     With ``vad=True`` (opt-in), detected speech spans also drive normal speed
     (design "B": normal = speech OR marker). If silero-vad isn't installed or the
     capture has no audio, this falls back to marker-only speed with a note.
+
+    With ``preview=True`` this renders a fast, low-quality ``review.preview.mp4``
+    (720p, ultrafast) for eyeballing chapter/title changes. The segment plan,
+    timestamps and captions are identical to a full render — only the encode and
+    resolution differ — so a preview is positionally faithful to the final.
     """
     session_dir = Path(session_dir)
     if pre < 0 or post < 0:
@@ -974,12 +1012,22 @@ def run_edit(
             "whole video."
         )
 
-    output = session_dir / OUTPUT_FILENAME
+    # --preview: fast low-quality render to a DISTINCT file (never clobbers the
+    # real review.mp4). Only the output name, a trailing downscale and the encode
+    # preset/crf change — the plan, timestamps and captions above are untouched.
+    output = session_dir / (PREVIEW_OUTPUT_FILENAME if preview else OUTPUT_FILENAME)
+    if preview:
+        out(f"Preview: {PREVIEW_SCALE_HEIGHT}p / {PREVIEW_PRESET} -> {output.name}")
     fontfile = _resolve_font(font)
-    filter_complex = build_filter_complex(plan, fontfile=fontfile, has_audio=has_audio)
+    filter_complex = build_filter_complex(
+        plan,
+        fontfile=fontfile,
+        has_audio=has_audio,
+        scale_height=PREVIEW_SCALE_HEIGHT if preview else None,
+    )
 
     # Pass the (potentially long, escaping-heavy) graph via a temp filterscript
-    # rather than inline, then clean it up — only review.mp4 is left behind.
+    # rather than inline, then clean it up — only the review clip is left behind.
     script_path: Path | None = None
     try:
         fd, name = tempfile.mkstemp(prefix="benchcam-edit-", suffix=".ffscript")
@@ -987,7 +1035,12 @@ def run_edit(
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(filter_complex)
         command = build_ffmpeg_edit_command(
-            capture, output, script_path, ffmpeg=ffmpeg
+            capture,
+            output,
+            script_path,
+            ffmpeg=ffmpeg,
+            preset=PREVIEW_PRESET if preview else DEFAULT_PRESET,
+            crf=PREVIEW_CRF if preview else DEFAULT_CRF,
         )
         result = run_ffmpeg_command(command)
     finally:
