@@ -27,6 +27,7 @@ from pathlib import Path
 
 from . import __version__
 from . import autochapter as autochapter_mod
+from . import chapters as chapters_mod
 from . import dashboard as dashboard_mod
 from . import editor as editor_mod
 from . import keypress
@@ -35,6 +36,7 @@ from . import live as live_mod
 from . import session as session_mod
 from . import transcribe as transcribe_mod
 from .autochapter import AutochapterError
+from .chapters import ChaptersError
 from .dashboard import DashboardError
 from .editor import EditError
 from .label import LabelError
@@ -376,6 +378,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_auto.set_defaults(func=cmd_autochapter)
 
+    # chapters
+    p_chap = sub.add_parser(
+        "chapters",
+        help="Review/re-title chapters without watching the video: print a sheet "
+        "of review timestamp + title + source quote, or --edit/--apply an editable "
+        "chapters.txt (updates only the label column in markers.csv).",
+    )
+    _add_root_arg(p_chap)
+    p_chap.add_argument(
+        "session",
+        nargs="?",
+        default=None,
+        help="Session id or folder path (default: newest session).",
+    )
+    chap_mode = p_chap.add_mutually_exclusive_group()
+    chap_mode.add_argument(
+        "--edit",
+        action="store_true",
+        help="Write an editable chapters.txt (edit titles, then --apply).",
+    )
+    chap_mode.add_argument(
+        "--apply",
+        action="store_true",
+        help="Read chapters.txt back and update ONLY the label of each matching "
+        "chapter (matched by marker index; stale lines are skipped with a warning).",
+    )
+    p_chap.set_defaults(func=cmd_chapters)
+
     # dashboard
     p_dash = sub.add_parser(
         "dashboard",
@@ -592,6 +622,15 @@ def cmd_autochapter(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_chapters(args: argparse.Namespace) -> int:
+    session_dir = editor_mod.resolve_session_dir(
+        Path(args.sessions_root), args.session
+    )
+    return chapters_mod.run_chapters(
+        session_dir, edit=args.edit, apply=args.apply
+    )
+
+
 def cmd_dashboard(args: argparse.Namespace) -> int:
     # --lan is the explicit, deliberate way to expose on the LAN; it overrides
     # --host so a phone can reach the dashboard without remembering 0.0.0.0.
@@ -672,6 +711,7 @@ def main(argv: list[str] | None = None) -> int:
         TranscribeError,
         LabelError,
         AutochapterError,
+        ChaptersError,
     ) as exc:
         print(f"benchcam: {exc}", file=sys.stderr)
         return 1

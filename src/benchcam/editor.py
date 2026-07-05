@@ -22,6 +22,7 @@ overwrites) ``review.mp4``.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -37,6 +38,9 @@ OUTPUT_FILENAME = "review.mp4"
 #: Fast, low-quality render written by ``edit --preview`` — a distinct filename so
 #: it never overwrites the real review.mp4.
 PREVIEW_OUTPUT_FILENAME = "review.preview.mp4"
+#: Raw->review timestamp map persisted after a render, consumed by
+#: ``benchcam chapters`` so titles can be reviewed/edited without the video.
+CHAPTERS_JSON_FILENAME = "chapters.json"
 OBS_POINTER_FILENAME = "obs_recording.txt"
 
 #: Full-render encode settings (unchanged default).
@@ -400,6 +404,124 @@ def describe_plan(
         )
     lines.append(f"  estimated review length: {out_total:.1f}s")
     return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# Chapter review-timestamp map (persisted for `benchcam chapters`)
+# --------------------------------------------------------------------------- #
+
+def _segment_out_bases(plan: list[Segment]) -> list[float]:
+    """Cumulative review-timeline start of each segment (its output offset)."""
+    bases: list[float] = []
+    acc = 0.0
+    for seg in plan:
+        bases.append(acc)
+        acc += seg.output_duration
+    return bases
+
+
+def _review_time_for_src(src: float, plan: list[Segment], bases: list[float]) -> float | None:
+    """Review-video time of source instant ``src`` (the caption's local-time map).
+
+    ``review = out_base(seg) + (src - seg.start) / seg.speed`` for the segment
+    containing ``src`` — the SAME formula ``_attach_chapter_captions`` uses, so a
+    chapter's persisted time equals the moment its tag appears on screen.
+    """
+    for i, seg in enumerate(plan):
+        if seg.start <= src < seg.end:
+            return bases[i] + (src - seg.start) / seg.speed
+    if plan and src <= plan[0].start:
+        return bases[0]
+    if plan and src >= plan[-1].end:  # at/after the very end
+        return bases[-1] + plan[-1].output_duration
+    return None
+
+
+def chapter_review_records(
+    rows: list[dict], plan: list[Segment], duration: float, *, pre: float
+) -> list[dict]:
+    """Per-chapter ``{marker_index, elapsed_seconds, review_seconds, ...}`` (pure).
+
+    Reuses ``_chapters`` for the authoritative chapter list/numbering (exactly what
+    the render draws) and joins each chapter back to its marker row by ordinal, so
+    the persisted map carries ``marker_index`` and the raw ``elapsed_seconds``
+    alongside the computed ``review_seconds``. Does not recompute or re-render.
+    """
+    events: list[tuple[float, str]] = []
+    labeled_rows: list[tuple[float, dict]] = []
+    for row in rows:
+        try:
+            elapsed = float(row.get("elapsed_seconds", ""))
+        except (TypeError, ValueError):
+            continue
+        label = (row.get("label") or "").strip()
+        events.append((elapsed, label))
+        if label:
+            labeled_rows.append((min(max(elapsed, 0.0), duration), row))
+    labeled_rows.sort(key=lambda pair: pair[0])  # same key/order as _chapters
+
+    bases = _segment_out_bases(plan)
+    records: list[dict] = []
+    seen: dict[float, bool] = {}
+    for chapter in _chapters(events, duration, pre):
+        if not (1 <= chapter.number <= len(labeled_rows)):
+            continue
+        row = labeled_rows[chapter.number - 1][1]
+        try:
+            marker_index = int(row.get("marker_index"))
+            elapsed = float(row.get("elapsed_seconds"))
+        except (TypeError, ValueError):
+            continue
+        review = _review_time_for_src(chapter.src_start, plan, bases)
+        note = ""
+        if review is None:
+            review, note = 0.0, "unresolved segment"
+        else:
+            key = round(review, 3)
+            if key in seen:  # two markers sharing an identical window start
+                note = "shares review start (approx)"
+            seen[key] = True
+        records.append(
+            {
+                "marker_index": marker_index,
+                "chapter_number": chapter.number,
+                "elapsed_seconds": round(elapsed, 3),
+                "review_seconds": round(review, 3),
+                "label": chapter.label,
+                "source": (row.get("source") or "").strip(),
+                "note": note,
+            }
+        )
+    return records
+
+
+def write_chapters_json(
+    session_dir: Path | str,
+    plan: list[Segment],
+    duration: float,
+    *,
+    pre: float,
+    review_filename: str,
+) -> Path:
+    """Persist the raw->review chapter map to ``chapters.json`` (atomically-ish).
+
+    An additive artifact for ``benchcam chapters``; it neither affects nor is read
+    by the render. Reuses ``read_markers`` for input and mirrors the other
+    sidecar writers' temp-then-replace pattern.
+    """
+    session_dir = Path(session_dir)
+    rows = read_markers(session_dir / MARKERS_FILENAME)
+    payload = {
+        "review_filename": review_filename,
+        "chapters": chapter_review_records(rows, plan, duration, pre=pre),
+    }
+    path = session_dir / CHAPTERS_JSON_FILENAME
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    tmp.replace(path)
+    return path
 
 
 # --------------------------------------------------------------------------- #
@@ -1053,4 +1175,13 @@ def run_edit(
     if result.returncode != 0:
         tail = "\n".join((result.stderr or "").strip().splitlines()[-8:])
         raise EditError(f"ffmpeg failed to render {output}:\n{tail}")
+
+    # Additive artifact: persist the raw->review timestamp map for `benchcam
+    # chapters` (reuses the plan already computed; never affects the render).
+    try:
+        write_chapters_json(
+            session_dir, plan, duration, pre=pre, review_filename=output.name
+        )
+    except OSError:  # pragma: no cover - a failed sidecar write must not fail edit
+        pass
     return output
