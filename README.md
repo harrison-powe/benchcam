@@ -9,9 +9,16 @@ an **off-the-shelf webcam**, and end up with a self-contained folder of plain
 files you can read with any text editor — plus an optional auto-edited review
 clip that timelapses the boring parts and slows down around each marker.
 
-> **Status:** v0. Validated on real hardware on a desk (CLI, dashboard, ffmpeg
-> and OBS capture, and the auto-edit all exercised); **not yet used in a real
-> bench session**. Treat it as an early, working tool, not a finished product.
+> **Status:** v0, now exercised on **real bench sessions**. Two real
+> `hello-motion` sessions exist — a connection-debugging session and one where the
+> actuator was recorded **spinning on command** (open-loop bring-up, narrated on
+> camera). The capture path, the physical **START/MARK/STOP/MUTE** buttons + status
+> LED, and the full post-capture pipeline (transcribe → auto-chapter → speech-aware
+> review clip) have all run on real footage. Honest caveats: the physical controls
+> are still a **breadboard** rig (**no custom PCB yet**), the actuator sessions were
+> bring-up/debugging rather than a polished showcase, and raw capture still records
+> to a **microSD** until the external SSD is deployed. Treat it as an early, working
+> tool, not a finished product.
 
 ## What BenchCam is (and is not)
 
@@ -22,18 +29,53 @@ clip that timelapses the boring parts and slows down around each marker.
   capturing a USB webcam, or OBS Studio over OBS WebSocket. **BenchCam does not
   build, sell, or include any camera, capture card, or hardware** — you supply a
   regular webcam and (optionally) OBS or ffmpeg.
-- It is **not** a camera system, not a robotics or motion-control system, and
-  not a PCB/firmware project. There are **no physical controls or custom
-  hardware** — just a CLI and a small local web dashboard. It **does not** drive
-  actuators or any moving hardware; it stays strictly on the observation side
-  (it may later *receive* external marker events, but never commands hardware).
+- It is **not** a camera system and **not** a robotics or motion-control system.
+  It uses off-the-shelf cameras and compute (a USB webcam, a Raspberry Pi) and
+  does **not** build a camera, capture card, image sensor, or high-speed video
+  electronics. It **does** have physical controls — tactile START/MARK/STOP/MUTE
+  buttons and a status LED wired to the Pi's GPIO (a **breadboard** rig today; no
+  custom PCB yet) — but it stays strictly on the **observation** side: it records
+  and marks hardware work and **never drives actuators or any moving hardware**
+  (it may *receive* external marker events, but never commands hardware).
 
 v0 ships with a **NullRecorder** (records no video) so you can use and test the
 session + marker workflow immediately, with or without a camera. The
-**FfmpegRecorder** records real video from a webcam on Windows (see
-[Recording video with ffmpeg](#recording-video-with-ffmpeg)), and the
-**ObsRecorder** drives OBS Studio's recording (see
+**FfmpegRecorder** records real, audio-synced video by driving an external
+`ffmpeg`: on **Linux / Raspberry Pi** it captures the webcam over V4L2 and the mic
+over ALSA into `capture.mkv` — this is the primary bench setup — and on
+**Windows** it captures over DirectShow (see
+[Recording video with ffmpeg](#recording-video-with-ffmpeg)). The **ObsRecorder**
+drives OBS Studio's recording on Windows (see
 [Recording video with OBS](#recording-video-with-obs)).
+
+## How it's deployed (two machines)
+
+In the real bench setup the work is split across two machines:
+
+- **Capture appliance — Raspberry Pi 5 (Linux).** The camera, ring light, and mic
+  live at the bench on the Pi. It records over V4L2/ALSA, exposes the physical
+  GPIO controls, and runs the dashboard and the button daemon as always-on
+  `systemd` services (both survive reboot). Marking a session never needs the
+  laptop.
+- **Compute / edit / upload — Windows laptop.** Whisper transcription, silero-VAD,
+  the `edit` render, and the Claude `label`/`autochapter` API calls run here (on
+  the GPU). `benchcam fetch <id>` pulls a session off the Pi over `scp`; only the
+  small finished `review.mp4` is uploaded.
+
+The heavy, torch-based extras (`[transcribe]`, `[vad]`) and the `[label]` extra are
+**laptop-only** — the Pi install stays stdlib-only so capture has no heavy deps.
+
+### Physical controls (GPIO)
+
+Four tactile buttons and a status LED wire to the Pi's 40-pin header (3.3V logic
+only): **START**, **MARK**, **STOP**, and **MUTE**, plus a **status LED** (through
+a ≥220Ω series resistor) that shows mute state. A small Pi-local daemon
+(`gpio_buttons.py`, intentionally **not** tracked in this repo) debounces the
+presses and calls the same session/marker code the CLI uses — START begins a
+recording, MARK drops a frame-accurate `source=gpio` marker, STOP finalizes, and
+MUTE marks a span to be timelapsed out of the review. It runs as the always-on
+`benchcam-buttons` service. This is a **breadboard** rig, validated in real
+sessions — **not** a custom PCB.
 
 ## Requirements
 
@@ -47,7 +89,13 @@ session + marker workflow immediately, with or without a camera. The
   [Recording video with OBS](#recording-video-with-obs).
 - A regular **USB webcam** if you want video (BenchCam does not provide one).
 
-## Install (Windows v0)
+## Install (Windows / laptop)
+
+The steps below set up the **laptop** (editing, transcription, upload). The
+**Raspberry Pi capture box** uses the same editable install on Linux (`pip install
+-e .`, no heavy extras) — see
+[Recording headless on a Raspberry Pi](#3-recording-headless-on-a-raspberry-pi-linux--v4l2--alsa)
+for the capture side.
 
 Open **PowerShell** (or **Command Prompt**) in the project folder.
 
@@ -179,14 +227,19 @@ sessions\2026-06-17_05-43-00\
 ### markers.csv
 
 ```csv
-marker_index,elapsed_seconds,wall_time,source,label
-1,2.500,2026-06-17T05:43:12.500000+00:00,manual,power on
-2,15.250,2026-06-17T05:43:25.250000+00:00,manual,chip lifted
+marker_index,elapsed_seconds,wall_time,source,label,narration
+1,2.500,2026-06-17T05:43:12.500000+00:00,gpio,Power Connected,so I've got power to the board now
+2,15.250,2026-06-17T05:43:25.250000+00:00,manual,chip lifted,
 ```
 
-- `elapsed_seconds` is measured from when you ran `benchcam run`.
-- `source` is `manual` for `benchcam mark`; a future external feed can use other
-  sources.
+- `elapsed_seconds` is measured from when the session started (`benchcam run`).
+- `source` records where the marker came from: `manual` (`benchcam mark` or the
+  dashboard), `gpio` (a physical button press), or `auto` (proposed by
+  `benchcam autochapter`). `gpio`/`manual` are ground truth and win over `auto`
+  on conflict.
+- `label` is the short on-screen chapter title. `narration` is the raw
+  transcribed speech near the marker (written by `benchcam transcribe`), kept in
+  its own column so transcription and labeling never clobber each other.
 
 ### notes.md
 
@@ -199,17 +252,29 @@ A free-form Markdown file for whatever you want to jot down during the session.
 | `benchcam new` | Create a new session folder and make it the active session. |
 | `benchcam run` | Start recording / start the session clock. |
 | `benchcam mark "label"` | Append a time-stamped marker to the active session. |
-| `benchcam live` | Open an interactive shell that marks the active session on a single keypress. |
+| `benchcam live` | Interactive shell that marks the active session on a single keypress. |
 | `benchcam end` | Stop recording and close the active session. |
-| `benchcam edit` | Render a marker-aware `review.mp4` (timelapse + normal-speed marker windows + captions). |
-| `benchcam dashboard` | Start a local web UI to run a whole session (start/mark/stop/review) from a browser. |
+| `benchcam transcribe` | Fill each marker's `narration` from the audio with Whisper *(laptop; `[transcribe]` extra)*. |
+| `benchcam label` | Summarize each marker's narration into a terse technical `label` via the Claude API *(laptop; `[label]` extra + `$ANTHROPIC_API_KEY`)*. |
+| `benchcam autochapter` | Propose chapters from the **full-session** transcript and write them as `source=auto` markers; merges with real markers, which win *(laptop; `[transcribe]`+`[label]`)*. |
+| `benchcam chapters` | Review/re-title chapters without re-watching: print, or `--edit`/`--apply` an editable `chapters.txt` (updates only the `label` column). |
+| `benchcam edit` | Render a marker-aware `review.mp4` (timelapse + normal-speed windows + persistent chapter tags). Flags: `--vad`, `--auto`, `--preview`, `--fetch`. |
+| `benchcam publish` | Export a paste-ready YouTube chapter block (remapped review timestamps) to `youtube_chapters.txt`. Read-only; never uploads. |
+| `benchcam fetch` | Pull a recorded session off the Pi over `scp` to the laptop and open it *(run on the laptop)*. |
+| `benchcam dashboard` | Local web UI to run a whole session (start/mark/stop/review) from a browser. |
 
 Useful options:
 
 - `benchcam new --profile NAME --camera DESC --microphone DESC --recorder {null,obs,ffmpeg} --notes "..."`
 - `benchcam mark "label" --source external`
-- `benchcam edit --session ID --pre 3 --post 5 --speed 8 --font PATH`
+- `benchcam edit --session ID --pre 3 --post 5 --speed 30 [--vad] [--auto] [--preview] [--fetch] --font PATH`
 - `--sessions-root PATH` (on any command) to use a different sessions directory.
+
+Roughly, a full session flows: **capture** (Pi: `run`/`mark`/`end` or the GPIO
+buttons) → **fetch** to the laptop → **transcribe** + **label** *or* **autochapter**
+→ **edit** → optionally **chapters** to re-title → **publish** the chapter block.
+`benchcam edit --auto` runs the transcribe → autochapter → render chain in one
+command, skipping any step whose output already exists.
 
 The "active" session is tracked by a small pointer file at
 `sessions\.active`, so `run`, `mark`, and `end` know which session to use.
@@ -389,22 +454,41 @@ to `markers.csv`, `obs_recording.txt` records its final path, and the marker
 `benchcam edit` turns a recorded session into a YouTube-ready "build log"
 `review.mp4` with no manual editing:
 
-- The stretches between markers are **timelapsed** (default `--speed 8` for 8x).
+- The stretches between events are **timelapsed** (default `--speed 30` for 30x).
 - Around each marker the clip drops to **normal speed** for a window — default
   `--pre 3` seconds before and `--post 5` seconds after. Overlapping or adjacent
   windows merge into one normal-speed segment.
-- **Audio** is kept in the normal-speed windows (your narration) and dropped in
-  the timelapsed stretches (no chipmunk audio).
-- Each marker that has a **label** gets that label burned on screen as a caption
-  during its normal-speed window.
+- With **`--vad`**, actual **speech** (detected by silero-VAD) also drives normal
+  speed, so a timelapse never cuts you off mid-sentence and a chapter never flips
+  before you start talking. A marker still forces a normal-speed window even when
+  silent.
+- **MUTE spans** (from `mute_spans.csv`, written by the MUTE button) are
+  **force-timelapsed** — the mirror of a marker — even over speech, so asides you
+  don't want in the video compress into the montage.
+- **Audio** is kept full-precision in the normal-speed windows (your narration)
+  and dropped in the timelapsed stretches (no chipmunk audio).
+- Each chapter's **label** renders as a persistent on-screen **chapter tag**
+  (top-left, monospace) that stays from its marker until the next chapter begins —
+  a running "where am I now" indicator, drawn across timelapse segments too, not
+  just a brief caption.
+- If the capture is **unfinalized/headerless** (a card-full or hard-killed
+  session with no duration header), `edit` does a one-time lossless remux to a
+  sidecar and proceeds instead of refusing.
 
 It reads the session's `capture.*` and `markers.csv` and writes `review.mp4` into
 the **same** session folder. It needs `ffmpeg` (and `ffprobe`, which ships with
 ffmpeg) on your `PATH` — see [Recording video with ffmpeg](#recording-video-with-ffmpeg)
 for install instructions.
 
+**One-command pipeline.** `benchcam edit --auto` orchestrates full-session
+**transcribe → autochapter → render** in a single command, skipping any expensive
+step whose output already exists (so re-rendering after a title tweak does zero
+Whisper/API work). `--preview` writes a fast 720p `review.preview.mp4` for
+iterating on chapter titles without a full render, and `--fetch` pulls the session
+from the Pi first. These compose with `--vad`/`--speed`.
+
 ```powershell
-# Edit the newest session with the defaults (3s pre / 5s post / 8x):
+# Edit the newest session with the defaults (3s pre / 5s post / 30x):
 benchcam edit
 
 # ...or a specific session, with custom pacing:
@@ -414,13 +498,14 @@ benchcam edit --session 2026-06-18_05-43-00 --pre 2 --post 6 --speed 12
 benchcam edit --font "C:\Windows\Fonts\arial.ttf"
 ```
 
-Captions are rendered by ffmpeg's `drawtext`. BenchCam escapes the caption text
-and the font path for ffmpeg's filtergraph automatically (so Windows paths like
-`C:\Windows\Fonts\arial.ttf` and labels containing `:`, `'`, `,`, `\`, or `%`
-render correctly), and passes the filtergraph via a temp filterscript. If the
-chosen `--font` isn't found, it falls back to a common system font (Arial on
-Windows), and finally to ffmpeg's default — the render never dies on a missing
-font. By default captions use `arial.ttf` on Windows; pass `--font` to override.
+Chapter tags are rendered by ffmpeg's `drawtext`. BenchCam escapes the text and
+the font path for ffmpeg's filtergraph automatically (so Windows paths like
+`C:\Windows\Fonts\consola.ttf` and labels containing `:`, `'`, `,`, `\`, or `%`
+render correctly), and passes the filtergraph via a temp filterscript. Tags
+default to a **monospace** "engineering-terminal" font (Consolas on Windows,
+DejaVu Sans Mono on Linux) for the aligned look; if the chosen `--font` isn't
+found it falls back to a known system monospace font, and finally to ffmpeg's
+default — the render never dies on a missing font. Pass `--font` to override.
 
 `benchcam edit` first prints the **segment plan** (which stretches are timelapsed
 vs. normal speed, and which captions land where) so you can sanity-check the
@@ -432,6 +517,10 @@ Notes:
 - **No markers** → a straight `--speed` timelapse of the whole video (still a
   quick way to skim a session); `edit` says so.
 - Marker times past the end of the video are clamped to its length.
+- The review is **timelapsed**, so a marker's raw `elapsed_seconds` is **not** its
+  timestamp in `review.mp4`. `edit` prints the raw→review time map in its segment
+  plan, and `benchcam publish` turns that map into a paste-ready YouTube chapter
+  block — don't hand YouTube the raw marker times.
 - If `capture.*` is missing (e.g. an OBS session where collection failed and only
   `obs_recording.txt` remains), `edit` follows that pointer to the original file;
   if it still can't be found, it fails with a clear message.
@@ -635,12 +724,18 @@ pytest
 
 ```
 src/benchcam/
-    cli.py            argparse CLI (new/run/mark/live/end/edit/dashboard)
+    cli.py            argparse CLI (new/run/mark/live/end/edit/transcribe/
+                      label/autochapter/chapters/publish/fetch/dashboard)
     session.py        session model + on-disk layout
-    markers.py        markers.csv reading/writing
+    markers.py        markers.csv reading/writing (incl. the narration column)
     live.py           interactive single-keypress marking shell
     keypress.py       cross-platform single-key reader (msvcrt / termios)
-    editor.py         marker-aware auto-edit -> review.mp4 (ffmpeg)
+    transcribe.py     Whisper narration -> the marker `narration` column ([transcribe])
+    label.py          narration -> terse technical label via the Claude API ([label])
+    autochapter.py    full-session transcript -> faithful source=auto chapters
+    chapters.py       review / re-title chapters (chapters.txt) without re-watching
+    editor.py         marker-aware auto-edit -> review.mp4 (timelapse, VAD, chapter tags)
+    publish.py        export a YouTube chapter block from the review remap
     dashboard.py      local web UI (stdlib http.server) over the existing logic
     config.py         local gitignored config (.benchcam/config.json; OBS creds)
     clock.py          time helpers
@@ -648,12 +743,13 @@ src/benchcam/
         base.py       Recorder interface
         null.py       NullRecorder (default)
         obs.py        ObsRecorder (OBS Studio via OBS WebSocket v5)
-        ffmpeg.py     FfmpegRecorder (ffmpeg subprocess; Windows/dshow)
+        ffmpeg.py     FfmpegRecorder (ffmpeg subprocess; Linux V4L2/ALSA + Windows dshow)
         collect.py    move an external recording into the session folder
 scripts/
     benchcam-dashboard.vbs   no-console Windows launcher (recommended; pinnable)
     benchcam-dashboard.bat   Windows launcher (keeps a console window)
     benchcam-dashboard.ps1   PowerShell launcher
+reviewer.py           laptop review hub (list / open / watch / make-review)
 tests/                unit tests
 ```
 

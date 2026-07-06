@@ -193,7 +193,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--speed",
         type=float,
         default=editor_mod.DEFAULT_SPEED,
-        help="Timelapse factor for the stretches between markers (default: 8).",
+        help="Timelapse factor for the stretches between markers (default: 30).",
     )
     p_edit.add_argument(
         "--font",

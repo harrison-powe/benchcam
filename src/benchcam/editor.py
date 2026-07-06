@@ -57,7 +57,7 @@ PREVIEW_SCALE_HEIGHT = 720
 
 DEFAULT_PRE = 3.0
 DEFAULT_POST = 5.0
-DEFAULT_SPEED = 8.0
+DEFAULT_SPEED = 30.0
 
 # Speech-aware speed (opt-in via --vad). Speech spans + marker windows both count
 # as normal speed; these tune how speech is turned into normal-speed regions.

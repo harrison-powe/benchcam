@@ -988,7 +988,7 @@ PAGE_HTML = """<!doctype html>
     <div class="row">
       <div><label>pre (s)</label><input id="pre" type="number" value="3" step="0.5"></div>
       <div><label>post (s)</label><input id="post" type="number" value="5" step="0.5"></div>
-      <div><label>speed (x)</label><input id="speed" type="number" value="8" step="1"></div>
+      <div><label>speed (x)</label><input id="speed" type="number" value="30" step="1"></div>
     </div>
     <p id="reviewOut" class="ok"></p>
     <table>
