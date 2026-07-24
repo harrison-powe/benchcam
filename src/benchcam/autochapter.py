@@ -20,6 +20,9 @@ Design (mirrors transcribe/label):
   pull in torch or anthropic. Runs on the laptop; reads ``ANTHROPIC_API_KEY``.
 - The full transcript is cached to ``transcript.json`` in the session folder so a
   re-run doesn't repeat the expensive Whisper pass (``--overwrite`` forces it).
+  The cache is SHARED with ``benchcam transcribe`` (the cache I/O lives in
+  :mod:`benchcam.transcribe`): either command creates it, both reuse it, and it is
+  only reused when it was produced with the requested Whisper model/language.
 - ANTI-HALLUCINATION is enforced in CODE, not just the prompt. Every proposed
   chapter must cite a transcript line and quote it verbatim; :func:`validate_chapters`
   drops any chapter whose quote is not a real substring of the cited segment and
@@ -53,9 +56,13 @@ from .markers import FIELDNAMES, MARKERS_FILENAME, read_markers
 from .session import SessionError, load_session
 from .transcribe import (
     DEFAULT_LANGUAGE,
+    TRANSCRIPT_FILENAME,
     TranscriptSegment,
+    load_cached_transcript,
     resolve_model as resolve_whisper_model,
+    save_transcript,
     transcribe_audio,
+    transcript_path,
 )
 
 #: Whole-session chapter reasoning is harder than per-marker labeling, so this
@@ -73,10 +80,6 @@ DEFAULT_CONFLICT_WINDOW = 20.0
 #: Source tag for AI-proposed chapters, so they're distinguishable from real
 #: presses (``gpio``) and typed markers (``manual``).
 AUTO_SOURCE = "auto"
-
-#: Cached full-session transcript (autochapter's own; never touches the per-marker
-#: ``narration`` column that ``transcribe`` owns).
-TRANSCRIPT_FILENAME = "transcript.json"
 
 #: Generous ceiling for the chapter JSON (a session is a handful of chapters).
 MAX_TOKENS = 2000
@@ -145,64 +148,6 @@ def resolve_model(model: str | None) -> str:
     if model:
         return model
     return os.environ.get(ENV_MODEL) or DEFAULT_MODEL
-
-
-# --------------------------------------------------------------------------- #
-# Full-session transcript cache (transcript.json)
-# --------------------------------------------------------------------------- #
-
-def transcript_path(session_dir: Path | str) -> Path:
-    return Path(session_dir) / TRANSCRIPT_FILENAME
-
-
-def load_cached_transcript(session_dir: Path | str) -> list[TranscriptSegment] | None:
-    """Load the cached transcript, or ``None`` if it is missing/unreadable.
-
-    A present-but-empty cache returns ``[]`` (a legitimately silent capture), which
-    the caller treats as "cached" so it is not re-transcribed every run.
-    """
-    path = transcript_path(session_dir)
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(data, dict) or not isinstance(data.get("segments"), list):
-        return None
-    segments: list[TranscriptSegment] = []
-    for item in data["segments"]:
-        try:
-            segments.append(
-                TranscriptSegment(
-                    float(item["start"]), float(item["end"]), str(item["text"]).strip()
-                )
-            )
-        except (KeyError, TypeError, ValueError):
-            continue
-    return segments
-
-
-def save_transcript(
-    session_dir: Path | str,
-    segments: list[TranscriptSegment],
-    *,
-    model: str,
-    language: str,
-) -> Path:
-    """Write the full transcript to ``transcript.json`` (atomically-ish)."""
-    path = transcript_path(session_dir)
-    payload = {
-        "model": model,
-        "language": language,
-        "segments": [
-            {"start": s.start, "end": s.end, "text": s.text} for s in segments
-        ],
-    }
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-    )
-    tmp.replace(path)
-    return path
 
 
 # --------------------------------------------------------------------------- #
@@ -568,17 +513,23 @@ def run_autochapter(
     """
     session_dir = Path(session_dir)
 
-    # 1) Full-session transcript (cached unless --overwrite).
-    segments = None if overwrite else load_cached_transcript(session_dir)
+    # 1) Full-session transcript (cached unless --overwrite; shared with
+    #    'benchcam transcribe', reused only if produced with the requested
+    #    Whisper model/language).
+    whisper_model_name = resolve_whisper_model(whisper_model)
+    segments = (
+        None
+        if overwrite
+        else load_cached_transcript(
+            session_dir, model=whisper_model_name, language=language
+        )
+    )
     if segments is None:
         segments = _transcribe_full(session_dir, whisper_model, language, out)
         if segments is None:
             return []  # no audio; nothing to do
         save_transcript(
-            session_dir,
-            segments,
-            model=resolve_whisper_model(whisper_model),
-            language=language,
+            session_dir, segments, model=whisper_model_name, language=language
         )
         out(f"Cached full transcript ({len(segments)} segment(s)) to {TRANSCRIPT_FILENAME}.")
     else:

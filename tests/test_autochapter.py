@@ -251,6 +251,24 @@ def test_run_autochapter_caches_transcript_and_writes_auto_markers(tmp_path, mon
     assert len([r for r in rows2 if r["source"] == AUTO_SOURCE]) == 2  # not doubled
 
 
+def test_run_autochapter_whisper_model_mismatch_re_transcribes(tmp_path, monkeypatch):
+    # A cached transcript from a DIFFERENT Whisper model is not reused: the
+    # provenance stamp makes it a miss, so the requested model re-transcribes
+    # and replaces the cache.
+    root = tmp_path / "sessions"
+    session = session_mod.create_session(root=root)
+    (session.folder / "capture.mkv").write_bytes(b"video")
+    ac.save_transcript(session.folder, _SEGMENTS, model="tiny", language="en")
+
+    calls = _patch_pipeline(monkeypatch, _SEGMENTS, _PAYLOAD)
+    ac.run_autochapter(session.folder, whisper_model="small", out=lambda _m: None)
+
+    assert calls["transcribe"] == 1  # stale-model cache ignored -> fresh pass
+    assert ac.load_cached_transcript(
+        session.folder, model="small", language="en"
+    ) == _SEGMENTS  # cache replaced, restamped with the requested model
+
+
 def test_run_autochapter_preserves_real_marker_in_written_file(tmp_path, monkeypatch):
     # File-level proof of the merge rule: a real gpio marker survives untouched
     # and a conflicting auto chapter is dropped when the file is rewritten.

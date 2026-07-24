@@ -21,6 +21,13 @@ Design notes:
   in torch — is unaffected. If Whisper is missing we raise a clear
   :class:`TranscribeError` telling the user how to install it, never a cryptic
   ``ImportError``.
+- ONE Whisper pass per session: the full-session transcript is SHARED with
+  ``benchcam autochapter`` through ``transcript.json`` in the session folder.
+  Whichever command runs first pays the (expensive, nondeterministic) Whisper
+  pass and caches it stamped with the model/language used; the other command
+  reuses it instead of re-rolling the dice on the same audio. A cache produced
+  with a different model/language is ignored and replaced. Recovery from a bad
+  cached transcript: delete ``transcript.json`` and re-run.
 - This is meant to run on the laptop (GPU/RAM). It is a STANDALONE command and is
   intentionally NOT wired into ``benchcam edit``.
 - The transcript->marker join (:func:`narration_for_marker` / :func:`plan_narrations`)
@@ -37,6 +44,7 @@ to Whisper directly — no separate audio-extraction step.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from dataclasses import dataclass
@@ -56,6 +64,12 @@ ENV_MODEL = "BENCHCAM_WHISPER_MODEL"
 #: English removes that failure mode; override with --language for other audio.
 DEFAULT_LANGUAGE = "en"
 DEFAULT_WINDOW = 5.0
+
+#: Full-session transcript cache, SHARED with ``benchcam autochapter``: whichever
+#: command runs first writes it (with the model/language it was produced with);
+#: both reuse it, so a session's audio is transcribed exactly once. To force a
+#: fresh pass (e.g. after a bad transcription), delete this file and re-run.
+TRANSCRIPT_FILENAME = "transcript.json"
 
 #: Appended to a marker's ``source`` when transcription fills its label.
 TRANSCRIBED_TAG = "transcribed"
@@ -99,6 +113,79 @@ def resolve_model(model: str | None) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Full-session transcript cache (transcript.json) — shared with autochapter
+# --------------------------------------------------------------------------- #
+
+def transcript_path(session_dir: Path | str) -> Path:
+    return Path(session_dir) / TRANSCRIPT_FILENAME
+
+
+def load_cached_transcript(
+    session_dir: Path | str,
+    *,
+    model: str | None = None,
+    language: str | None = None,
+) -> list[TranscriptSegment] | None:
+    """Load the cached transcript, or ``None`` if missing/unreadable/mismatched.
+
+    When ``model``/``language`` are given, the cache must have been produced with
+    exactly those settings (recorded by :func:`save_transcript`) or it is treated
+    as a miss — a 'small' transcript is not a valid answer to a ``--model medium``
+    run. Left as ``None`` (display uses, e.g. the chapters sheet), any readable
+    cache loads.
+
+    A present-but-empty cache returns ``[]`` (a legitimately silent capture), which
+    the caller treats as "cached" so it is not re-transcribed every run.
+    """
+    path = transcript_path(session_dir)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("segments"), list):
+        return None
+    if model is not None and data.get("model") != model:
+        return None
+    if language is not None and data.get("language") != language:
+        return None
+    segments: list[TranscriptSegment] = []
+    for item in data["segments"]:
+        try:
+            segments.append(
+                TranscriptSegment(
+                    float(item["start"]), float(item["end"]), str(item["text"]).strip()
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    return segments
+
+
+def save_transcript(
+    session_dir: Path | str,
+    segments: list[TranscriptSegment],
+    *,
+    model: str,
+    language: str,
+) -> Path:
+    """Write the full transcript to ``transcript.json`` (atomically-ish)."""
+    path = transcript_path(session_dir)
+    payload = {
+        "model": model,
+        "language": language,
+        "segments": [
+            {"start": s.start, "end": s.end, "text": s.text} for s in segments
+        ],
+    }
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    tmp.replace(path)
+    return path
+
+
+# --------------------------------------------------------------------------- #
 # Whisper (lazy import so the core/Pi install never needs torch)
 # --------------------------------------------------------------------------- #
 
@@ -126,7 +213,17 @@ def transcribe_audio(
     """
     whisper = _import_whisper()
     loaded = whisper.load_model(model)
-    result = loaded.transcribe(str(capture), language=language or None)
+    # condition_on_previous_text=False: feeding each window's output back in as
+    # the next window's prompt is Whisper's documented repetition-loop mechanism
+    # (one bad window seeds the rest; the long quiet stretches of bench audio are
+    # the classic trigger). The trade is real but small: that conditioning is
+    # also what carries proper-noun consistency across windows, so domain terms
+    # (already shaky here — "coyote" for Kyogre) may be misheard slightly more
+    # often. Accepted: a loop destroys a session's narration; a misheard noun
+    # costs one title edit.
+    result = loaded.transcribe(
+        str(capture), language=language or None, condition_on_previous_text=False
+    )
     segments: list[TranscriptSegment] = []
     for seg in result.get("segments", []) or []:
         try:
@@ -239,6 +336,13 @@ def run_transcribe(
 ) -> list[NarrationAssignment]:
     """Transcribe a session's audio into each marker's ``narration`` column.
 
+    The full-session transcript is SHARED with ``benchcam autochapter`` via
+    ``transcript.json``: a cache produced with the same Whisper model/language is
+    reused (no second Whisper pass over the same audio), and a fresh pass saves
+    its result there for the other command. Deleting ``transcript.json`` forces a
+    fresh pass (the recovery path for a bad transcription) — ``--overwrite`` only
+    controls replacing existing narration, never the cache.
+
     ``language`` pins Whisper's language (default English) to avoid misdetection;
     pass an empty string to let Whisper auto-detect. Returns the assignments that
     were written (empty if nothing changed).
@@ -247,17 +351,30 @@ def run_transcribe(
     if window < 0:
         raise TranscribeError("--window must be >= 0 seconds.")
 
-    capture = find_capture(session_dir)
+    model_name = resolve_model(model)
 
-    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
-        raise TranscribeError(_FFMPEG_HINT)
-
-    if not probe_has_audio(capture):
+    # One Whisper pass per session: reuse the shared transcript.json when it was
+    # produced with the same model/language. The cache-hit path never opens the
+    # capture — narration is rebuildable even with the (huge) video file absent.
+    segments = load_cached_transcript(session_dir, model=model_name, language=language)
+    if segments is not None:
         out(
-            f"{capture} has no audio track — nothing to transcribe. (Record with a "
-            "microphone, e.g. the Yeti, to use auto-labeling.)"
+            f"Using cached full-session transcript ({len(segments)} segment(s)) "
+            f"from {TRANSCRIPT_FILENAME}; delete that file to force a fresh pass."
         )
-        return []
+
+    if segments is None:
+        capture = find_capture(session_dir)
+
+        if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+            raise TranscribeError(_FFMPEG_HINT)
+
+        if not probe_has_audio(capture):
+            out(
+                f"{capture} has no audio track — nothing to transcribe. (Record with a "
+                "microphone, e.g. the Yeti, to use auto-labeling.)"
+            )
+            return []
 
     markers_file = session_dir / MARKERS_FILENAME
     rows = read_markers(markers_file)
@@ -265,13 +382,15 @@ def run_transcribe(
         out(f"No markers in {markers_file} — nothing to label.")
         return []
 
-    model_name = resolve_model(model)
-    out(
-        f"Transcribing {capture} with Whisper model {model_name!r} "
-        f"(language={language or 'auto'}) (this can take a while)..."
-    )
-    segments = transcribe_audio(capture, model_name, language=language)
-    out(f"Got {len(segments)} transcript segment(s).")
+    if segments is None:
+        out(
+            f"Transcribing {capture} with Whisper model {model_name!r} "
+            f"(language={language or 'auto'}) (this can take a while)..."
+        )
+        segments = transcribe_audio(capture, model_name, language=language)
+        out(f"Got {len(segments)} transcript segment(s).")
+        save_transcript(session_dir, segments, model=model_name, language=language)
+        out(f"Cached full transcript to {TRANSCRIPT_FILENAME} (shared with autochapter).")
 
     assignments = plan_narrations(
         rows, segments, window=window, overwrite=overwrite

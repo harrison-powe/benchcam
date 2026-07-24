@@ -184,6 +184,9 @@ def _mock_auto_pipeline(monkeypatch):
 
     Returns a call counter so tests can assert which expensive steps ran.
     """
+    # Pin the Whisper-model resolution: cache reuse is provenance-checked, so a
+    # stray $BENCHCAM_WHISPER_MODEL would turn the model="small" cache into a miss.
+    monkeypatch.delenv("BENCHCAM_WHISPER_MODEL", raising=False)
     calls = {"transcribe": 0, "api": 0, "render": 0}
 
     def fake_transcribe(capture, model, *, language="en"):

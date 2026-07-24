@@ -19,10 +19,13 @@ from benchcam.transcribe import (
     ENV_MODEL,
     TranscribeError,
     TranscriptSegment,
+    load_cached_transcript,
     narration_for_marker,
     plan_narrations,
     resolve_model,
     run_transcribe,
+    save_transcript,
+    transcript_path,
 )
 
 
@@ -292,3 +295,139 @@ def _rewrite(path, rows):
         writer.writeheader()
         for row in rows:
             writer.writerow({f: row.get(f, "") for f in FIELDNAMES})
+
+
+# --------------------------------------------------------------------------- #
+# Shared transcript.json cache (one Whisper pass per session)
+# --------------------------------------------------------------------------- #
+
+def _session_no_capture(tmp_path):
+    """A started session with one marker at 10s and NO capture file on disk."""
+    from benchcam import session as session_mod
+
+    root = tmp_path / "sessions"
+    session = session_mod.create_session(root=root)
+    session_mod.start_session(session)
+    session_mod.add_marker(session, "", source="manual")
+    rows = read_markers(session.markers_file)
+    rows[0]["elapsed_seconds"] = "10.000"
+    _rewrite(session.markers_file, rows)
+    return session
+
+
+def _fail_transcribe(*_a, **_k):
+    raise AssertionError("Whisper must not run when a valid cached transcript exists")
+
+
+def test_run_transcribe_reuses_cache_without_whisper_or_capture(tmp_path, monkeypatch):
+    # The cache-hit path needs neither the video nor ffmpeg: no capture file is
+    # written and find_capture/shutil.which/probe_has_audio are NOT patched, so
+    # touching any of them would fail loudly.
+    session = _session_no_capture(tmp_path)
+    save_transcript(
+        session.folder, [seg(9.0, 11.0, "power on")], model="small", language="en"
+    )
+    monkeypatch.setattr(transcribe_mod, "transcribe_audio", _fail_transcribe)
+
+    messages: list[str] = []
+    plan = run_transcribe(session.folder, model="small", window=5.0, out=messages.append)
+
+    assert [(a.marker_index, a.narration) for a in plan] == [(1, "power on")]
+    assert read_markers(session.markers_file)[0]["narration"] == "power on"
+    assert any("cached" in m.lower() for m in messages)
+
+
+def test_run_transcribe_cache_miss_saves_shared_transcript(tmp_path, monkeypatch):
+    from benchcam import session as session_mod
+
+    session = _session_with_markers(tmp_path)
+    session_mod.add_marker(session, "", source="manual")
+    rows = read_markers(session.markers_file)
+    rows[0]["elapsed_seconds"] = "10.000"
+    _rewrite(session.markers_file, rows)
+    _patch_environment(monkeypatch, [seg(9.0, 11.0, "power on")])
+
+    run_transcribe(session.folder, model="small", window=5.0, out=lambda _m: None)
+
+    # The pass was saved for autochapter, stamped with its model/language...
+    assert transcript_path(session.folder).exists()
+    assert load_cached_transcript(
+        session.folder, model="small", language="en"
+    ) == [seg(9.0, 11.0, "power on")]
+    # ...and the stamp is enforced: a different model does not reuse it.
+    assert load_cached_transcript(session.folder, model="medium", language="en") is None
+
+
+def test_run_transcribe_model_mismatch_re_transcribes_and_replaces_cache(
+    tmp_path, monkeypatch
+):
+    from benchcam import session as session_mod
+
+    session = _session_with_markers(tmp_path)
+    session_mod.add_marker(session, "", source="manual")
+    rows = read_markers(session.markers_file)
+    rows[0]["elapsed_seconds"] = "10.000"
+    _rewrite(session.markers_file, rows)
+    save_transcript(
+        session.folder, [seg(9.0, 11.0, "stale small text")], model="small", language="en"
+    )
+    _patch_environment(monkeypatch, [seg(9.0, 11.0, "fresh medium text")])
+
+    run_transcribe(session.folder, model="medium", window=5.0, out=lambda _m: None)
+
+    assert read_markers(session.markers_file)[0]["narration"] == "fresh medium text"
+    assert load_cached_transcript(
+        session.folder, model="medium", language="en"
+    ) == [seg(9.0, 11.0, "fresh medium text")]
+
+
+def test_run_transcribe_empty_cached_transcript_is_still_a_hit(tmp_path, monkeypatch):
+    # [] = a legitimately silent capture: reused (no Whisper), nothing to fill.
+    session = _session_no_capture(tmp_path)
+    save_transcript(session.folder, [], model="small", language="en")
+    monkeypatch.setattr(transcribe_mod, "transcribe_audio", _fail_transcribe)
+
+    messages: list[str] = []
+    plan = run_transcribe(session.folder, model="small", out=messages.append)
+    assert plan == []
+    assert any("no marker narration" in m.lower() for m in messages)
+
+
+def test_load_cached_transcript_provenance(tmp_path):
+    save_transcript(tmp_path, [seg(1.0, 2.0, "hi")], model="small", language="en")
+    hit = [seg(1.0, 2.0, "hi")]
+    assert load_cached_transcript(tmp_path) == hit  # display use: no check
+    assert load_cached_transcript(tmp_path, model="small", language="en") == hit
+    assert load_cached_transcript(tmp_path, model="medium", language="en") is None
+    assert load_cached_transcript(tmp_path, model="small", language="") is None
+    assert load_cached_transcript(tmp_path / "missing") is None
+
+
+def test_load_cached_transcript_missing_provenance_fails_strict_check(tmp_path):
+    # A cache with no model/language stamp still loads for display, but is a
+    # MISS for a provenance-checked reuse (conservative: re-transcribe).
+    transcript_path(tmp_path).write_text(
+        '{"segments": [{"start": 1, "end": 2, "text": "hi"}]}', encoding="utf-8"
+    )
+    assert load_cached_transcript(tmp_path) == [seg(1.0, 2.0, "hi")]
+    assert load_cached_transcript(tmp_path, model="small", language="en") is None
+
+
+def test_transcribe_audio_disables_previous_text_conditioning(monkeypatch):
+    # The repetition-loop guard: the real Whisper call must never feed one
+    # window's text into the next (condition_on_previous_text=False).
+    captured = {}
+
+    class _Loaded:
+        def transcribe(self, path, **kwargs):
+            captured.update(kwargs)
+            return {"segments": [{"start": 1.0, "end": 2.0, "text": " hi "}]}
+
+    class _Whisper:
+        @staticmethod
+        def load_model(name):
+            return _Loaded()
+
+    monkeypatch.setattr(transcribe_mod, "_import_whisper", lambda: _Whisper)
+    assert transcribe_mod.transcribe_audio("capture.mkv", "small") == [seg(1.0, 2.0, "hi")]
+    assert captured["condition_on_previous_text"] is False

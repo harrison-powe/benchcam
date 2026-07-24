@@ -278,7 +278,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_tr = sub.add_parser(
         "transcribe",
         help="Auto-label markers from spoken narration using Whisper "
-        "(runs on the laptop; needs the [transcribe] extra).",
+        "(runs on the laptop; needs the [transcribe] extra). Shares the "
+        "transcript.json full-session transcript with autochapter - whichever "
+        "runs first transcribes once, the other reuses it; delete that file to "
+        "force a fresh Whisper pass.",
     )
     _add_root_arg(p_tr)
     p_tr.add_argument(
