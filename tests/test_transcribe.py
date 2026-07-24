@@ -413,6 +413,43 @@ def test_load_cached_transcript_missing_provenance_fails_strict_check(tmp_path):
     assert load_cached_transcript(tmp_path, model="small", language="en") is None
 
 
+def test_run_transcribe_fresh_transcript_forces_repass_and_restamps(tmp_path, monkeypatch):
+    # fresh_transcript=True (used by edit --auto --overwrite-auto) bypasses a
+    # VALID cache, re-transcribes exactly once, and replaces the cache — while
+    # narration replacement still obeys the separate overwrite knob.
+    from benchcam import session as session_mod
+
+    session = _session_with_markers(tmp_path)
+    session_mod.add_marker(session, "", source="manual")
+    rows = read_markers(session.markers_file)
+    rows[0]["elapsed_seconds"] = "10.000"
+    rows[0]["narration"] = "hand narration"
+    _rewrite(session.markers_file, rows)
+    save_transcript(
+        session.folder, [seg(9.0, 11.0, "old cached text")], model="small", language="en"
+    )
+
+    counter = {"n": 0}
+
+    def counting(*_a, **_k):
+        counter["n"] += 1
+        return [seg(9.0, 11.0, "fresh text")]
+
+    _patch_environment(monkeypatch, [])
+    monkeypatch.setattr(transcribe_mod, "transcribe_audio", counting)
+
+    run_transcribe(
+        session.folder, model="small", fresh_transcript=True, out=lambda _m: None
+    )
+
+    assert counter["n"] == 1  # the valid cache was bypassed, exactly one pass
+    assert load_cached_transcript(session.folder, model="small", language="en") == [
+        seg(9.0, 11.0, "fresh text")
+    ]
+    # narration overwrite is a SEPARATE knob: existing narration is kept.
+    assert read_markers(session.markers_file)[0]["narration"] == "hand narration"
+
+
 def test_transcribe_audio_disables_previous_text_conditioning(monkeypatch):
     # The repetition-loop guard: the real Whisper call must never feed one
     # window's text into the next (condition_on_previous_text=False).

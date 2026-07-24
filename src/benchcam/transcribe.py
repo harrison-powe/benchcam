@@ -63,7 +63,13 @@ ENV_MODEL = "BENCHCAM_WHISPER_MODEL"
 #: narration (e.g. flag English as Norwegian and hallucinate). Pinning it to
 #: English removes that failure mode; override with --language for other audio.
 DEFAULT_LANGUAGE = "en"
-DEFAULT_WINDOW = 5.0
+#: +/- seconds of transcript joined around each marker. 10 comes from real-session
+#: evidence: at +/-5 the narration misses speech that starts a beat after the
+#: press (the operator finishes the action, then talks), while +/-20 bleeds the
+#: NEIGHBORING event's speech into this marker's narration. NOTE: two presses
+#: closer than 20s apart still get overlapping windows and therefore similar
+#: labels - that is expected behavior for a double-press, not a labeler flaw.
+DEFAULT_WINDOW = 10.0
 
 #: Full-session transcript cache, SHARED with ``benchcam autochapter``: whichever
 #: command runs first writes it (with the model/language it was produced with);
@@ -332,6 +338,7 @@ def run_transcribe(
     language: str = DEFAULT_LANGUAGE,
     window: float = DEFAULT_WINDOW,
     overwrite: bool = False,
+    fresh_transcript: bool = False,
     out: Callable[[str], object] = print,
 ) -> list[NarrationAssignment]:
     """Transcribe a session's audio into each marker's ``narration`` column.
@@ -342,6 +349,12 @@ def run_transcribe(
     its result there for the other command. Deleting ``transcript.json`` forces a
     fresh pass (the recovery path for a bad transcription) — ``--overwrite`` only
     controls replacing existing narration, never the cache.
+
+    ``fresh_transcript`` forces a new Whisper pass even over a valid cache and
+    restamps it — used by ``edit --auto --overwrite-auto`` so regenerated
+    chapters and any newly filled narration derive from ONE shared pass. It is a
+    function-level knob only (no CLI flag) and does NOT imply ``overwrite``:
+    existing narration is still kept.
 
     ``language`` pins Whisper's language (default English) to avoid misdetection;
     pass an empty string to let Whisper auto-detect. Returns the assignments that
@@ -356,7 +369,11 @@ def run_transcribe(
     # One Whisper pass per session: reuse the shared transcript.json when it was
     # produced with the same model/language. The cache-hit path never opens the
     # capture — narration is rebuildable even with the (huge) video file absent.
-    segments = load_cached_transcript(session_dir, model=model_name, language=language)
+    segments = (
+        None
+        if fresh_transcript
+        else load_cached_transcript(session_dir, model=model_name, language=language)
+    )
     if segments is not None:
         out(
             f"Using cached full-session transcript ({len(segments)} segment(s)) "

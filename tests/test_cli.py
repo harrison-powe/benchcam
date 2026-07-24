@@ -9,7 +9,9 @@ from benchcam import autochapter as autochapter_mod
 from benchcam import cli as cli_mod
 from benchcam import dashboard as dashboard_mod
 from benchcam import editor as editor_mod
+from benchcam import label as label_mod
 from benchcam import session as session_mod
+from benchcam import transcribe as transcribe_mod
 from benchcam.cli import cmd_fetch, main
 from benchcam.markers import Marker, append_marker, read_markers
 from benchcam.transcribe import TranscriptSegment as TS
@@ -180,14 +182,18 @@ class _Resp:
 
 
 def _mock_auto_pipeline(monkeypatch):
-    """Mock Whisper + the Anthropic client on autochapter, and stub the render.
+    """Mock Whisper + the Anthropic clients across the --auto pipeline, and stub
+    the render.
 
-    Returns a call counter so tests can assert which expensive steps ran.
+    The pipeline is transcribe -> label -> autochapter -> render, so Whisper and
+    capture probing are patched on BOTH transcribe and autochapter (separate
+    name bindings of the same functions), and label gets its own fake client
+    (returns "Test Label") with its own counter. Returns the call counters.
     """
     # Pin the Whisper-model resolution: cache reuse is provenance-checked, so a
     # stray $BENCHCAM_WHISPER_MODEL would turn the model="small" cache into a miss.
     monkeypatch.delenv("BENCHCAM_WHISPER_MODEL", raising=False)
-    calls = {"transcribe": 0, "api": 0, "render": 0}
+    calls = {"transcribe": 0, "api": 0, "label_api": 0, "render": 0}
 
     def fake_transcribe(capture, model, *, language="en"):
         calls["transcribe"] += 1
@@ -201,11 +207,23 @@ def _mock_auto_pipeline(monkeypatch):
     class _Client:
         messages = _Msgs()
 
+    class _LabelMsgs:
+        def create(self, **kwargs):
+            calls["label_api"] += 1
+            return _Resp("Test Label")
+
+    class _LabelClient:
+        messages = _LabelMsgs()
+
     monkeypatch.setattr(autochapter_mod, "transcribe_audio", fake_transcribe)
     monkeypatch.setattr(autochapter_mod, "probe_has_audio", lambda *a, **k: True)
     monkeypatch.setattr(autochapter_mod, "find_capture", lambda d: Path(d) / "capture.mkv")
     monkeypatch.setattr(autochapter_mod.shutil, "which", lambda _n: "/usr/bin/x")
     monkeypatch.setattr(autochapter_mod, "make_client", lambda: _Client())
+    monkeypatch.setattr(transcribe_mod, "transcribe_audio", fake_transcribe)
+    monkeypatch.setattr(transcribe_mod, "probe_has_audio", lambda *a, **k: True)
+    monkeypatch.setattr(transcribe_mod, "find_capture", lambda d: Path(d) / "capture.mkv")
+    monkeypatch.setattr(label_mod, "make_client", lambda: _LabelClient())
 
     def fake_render(session_dir, **kwargs):
         calls["render"] += 1
@@ -238,7 +256,9 @@ def test_edit_auto_skips_autochapter_when_auto_markers_exist(tmp_path, monkeypat
     session = session_mod.create_session(root=root)
     (session.folder / "capture.mkv").write_bytes(b"video")
     # A prior source=auto chapter already exists (as after a first --auto run, or a
-    # title edit that keeps the source=auto cell).
+    # title edit that keeps the source=auto cell), and the transcript is cached —
+    # the fully-processed state, which must cost zero Whisper/API before render.
+    autochapter_mod.save_transcript(session.folder, _SEGS, model="small", language="en")
     append_marker(session.markers_file, Marker(1, 42.0, "", "auto", "Prior Chapter"))
 
     calls = _mock_auto_pipeline(monkeypatch)
@@ -269,6 +289,84 @@ def test_edit_auto_runs_both_when_neither_exists(tmp_path, monkeypatch):
     assert autochapter_mod.transcript_path(session.folder).exists()  # cached
     auto = [r for r in read_markers(session.markers_file) if r["source"] == "auto"]
     assert [r["label"] for r in auto] == ["Stiffness Test", "Velocity Sweep"]
+
+
+def test_edit_auto_fills_narration_and_labels_empty_gpio_markers(tmp_path, monkeypatch):
+    # THE defect the pipeline closes: a gpio press arrives with an empty label;
+    # --auto must give it narration from its own +/-window and an AI label, so
+    # the press renders with text AND its conflict-window suppression of the
+    # nearby auto proposal becomes correct (the real press carries content).
+    root = tmp_path / "sessions"
+    session = session_mod.create_session(root=root)
+    (session.folder / "capture.mkv").write_bytes(b"video")
+    append_marker(session.markers_file, Marker(1, 12.0, "", "gpio", ""))
+
+    calls = _mock_auto_pipeline(monkeypatch)
+    rc = main(["edit", "--sessions-root", str(root), "--session", session.session_id, "--auto"])
+
+    assert rc == 0
+    assert calls["transcribe"] == 1 and calls["label_api"] == 1 and calls["api"] == 1
+    rows = read_markers(session.markers_file)
+    gpio = next(r for r in rows if "gpio" in r["source"].split("+"))
+    assert gpio["narration"] == "okay starting the stiffness test now"  # +/-10 of 12s
+    assert gpio["label"] == "Test Label"
+    assert gpio["source"] == "gpio+transcribed+ai-labeled"
+    # The 10s proposal is suppressed by the (now labeled) press at 12s; only the
+    # far chapter survives — suppression now removes a duplicate, not the title.
+    auto = [r for r in rows if r["source"] == "auto"]
+    assert [r["label"] for r in auto] == ["Velocity Sweep"]
+
+
+def test_edit_auto_overwrite_auto_runs_exactly_one_whisper_pass(tmp_path, monkeypatch):
+    # Regression guard for the double-transcription defect: --overwrite-auto
+    # forces the fresh pass at step 1 (run_transcribe) and autochapter must then
+    # REUSE it via the shared cache — one pass total, chapters and narration
+    # from the SAME transcript. A valid cache exists, so the pass must happen
+    # exactly once (not zero: forced fresh; not two: shared).
+    root = tmp_path / "sessions"
+    session = session_mod.create_session(root=root)
+    (session.folder / "capture.mkv").write_bytes(b"video")
+    autochapter_mod.save_transcript(session.folder, _SEGS, model="small", language="en")
+    append_marker(session.markers_file, Marker(1, 500.0, "", "auto", "Stale Auto"))
+
+    calls = _mock_auto_pipeline(monkeypatch)
+    rc = main([
+        "edit", "--sessions-root", str(root), "--session", session.session_id,
+        "--auto", "--overwrite-auto",
+    ])
+
+    assert rc == 0
+    assert calls["transcribe"] == 1  # exactly one pass, at step 1
+    assert calls["api"] == 1  # chapters regenerated from that same transcript
+    auto = [r["label"] for r in read_markers(session.markers_file) if r["source"] == "auto"]
+    assert auto == ["Stiffness Test", "Velocity Sweep"]  # stale row replaced
+
+
+def test_edit_auto_never_touches_hand_written_labels_or_narration(tmp_path, monkeypatch):
+    # Invariants: narration AND label stay fill-empty-only, even under
+    # --overwrite-auto. Hand titles and hand-rebuilt narration must survive.
+    root = tmp_path / "sessions"
+    session = session_mod.create_session(root=root)
+    (session.folder / "capture.mkv").write_bytes(b"video")
+    # Hand label + empty narration: narration may fill, the label must not move.
+    append_marker(session.markers_file, Marker(1, 12.0, "", "gpio", "HAND TITLE"))
+    # Hand narration + empty label: narration must not move, label fills FROM it.
+    append_marker(
+        session.markers_file, Marker(2, 302.0, "", "gpio", "", "my hand narration")
+    )
+
+    calls = _mock_auto_pipeline(monkeypatch)
+    rc = main([
+        "edit", "--sessions-root", str(root), "--session", session.session_id,
+        "--auto", "--overwrite-auto",
+    ])
+
+    assert rc == 0
+    rows = {int(r["marker_index"]): r for r in read_markers(session.markers_file)}
+    assert rows[1]["label"] == "HAND TITLE"  # never clobbered
+    assert rows[1]["narration"] == "okay starting the stiffness test now"
+    assert rows[2]["narration"] == "my hand narration"  # fill-empty-only
+    assert rows[2]["label"] == "Test Label"  # filled FROM the hand narration
 
 
 def test_edit_overwrite_auto_preserves_gpio_and_manual_markers(tmp_path, monkeypatch):
@@ -378,6 +476,10 @@ def test_edit_fetch_composes_with_auto(tmp_path, monkeypatch):
     scp, auto, rendered = [], [], []
     monkeypatch.setattr(cli_mod.subprocess, "run", _fake_scp_creates_session(root, _FETCH_SID, scp))
     monkeypatch.setattr(cli_mod.os, "startfile", lambda *a, **k: None, raising=False)
+    # This test asserts fetch -> pipeline -> render ORDERING, not pipeline
+    # internals (covered elsewhere): stub all three pipeline steps.
+    monkeypatch.setattr(transcribe_mod, "run_transcribe", lambda sd, **k: [])
+    monkeypatch.setattr(label_mod, "run_label", lambda sd, **k: [])
     monkeypatch.setattr(autochapter_mod, "run_autochapter", lambda sd, **k: auto.append(Path(sd)))
     _stub_render(monkeypatch, rendered)
 
