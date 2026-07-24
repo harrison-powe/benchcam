@@ -4,6 +4,7 @@ Part-A chapters.json review-time map written by edit."""
 from __future__ import annotations
 
 import json
+import re
 
 from benchcam import chapters as chapters_mod
 from benchcam import editor as editor_mod
@@ -153,11 +154,20 @@ def test_sheet_fallback_without_render(tmp_path):
 # --------------------------------------------------------------------------- #
 
 def _retitle(session, mapping):
-    """Edit chapters.txt in place: {old_title: new_title}."""
+    """Edit chapters.txt in place: {old_title: new_title}.
+
+    The title is the whole remainder of an entry line, so match '] <old>' at
+    end-of-line. A lambda replacement avoids re backref/escape issues when a new
+    title contains digits or backslashes.
+    """
     path = session.folder / "chapters.txt"
     text = path.read_text(encoding="utf-8")
     for old, new in mapping.items():
-        text = text.replace(f"] {old}    #", f"] {new}    #")
+        text = re.sub(
+            rf"(?m)^(\[\d+@[-0-9.]+\] ){re.escape(old)}$",
+            lambda m, _new=new: m.group(1) + _new,
+            text,
+        )
     path.write_text(text, encoding="utf-8")
 
 
@@ -187,22 +197,144 @@ def test_apply_skips_malformed_lines(tmp_path):
     session = _session(tmp_path)
     append_marker(session.markers_file, Marker(1, 10.0, "w", "manual", "Alpha"))
 
-    (session.folder / "chapters.txt").write_text(
-        "# header comment\n"
-        "[1@10.000] Renamed    # review 00:00.7  raw 00:10.0  | \"q\"\n"
-        "this is not a valid line at all\n"
-        "[99@10.000] Ghost    # no marker with index 99\n",
+    # Produce a REAL chapters.txt via --edit, retitle the valid entry, then inject
+    # a garbage line and an unknown-index entry (new-format entry lines, no inline
+    # comment). Operating on --edit output, not a hand-written old-format fixture.
+    chapters_mod.run_chapters(session.folder, edit=True, out=lambda _m: None)
+    _retitle(session, {"Alpha": "Renamed"})
+    path = session.folder / "chapters.txt"
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + "this is not a valid line at all\n"
+        + "[99@10.000] Ghost\n",
         encoding="utf-8",
     )
 
     warnings = []
-    chapters_mod.run_chapters(session.folder, apply=True, out=warnings.append)
+    rc = chapters_mod.run_chapters(session.folder, apply=True, out=warnings.append)
 
     assert _rows(session)[1]["label"] == "Renamed"  # the good line applied
     text = "\n".join(warnings)
     assert "not a '[index@elapsed] Title' line" in text  # the garbage line
     assert "[99]" in text and "no marker" in text  # the unknown index
     assert "Applied 1 title(s); skipped 2." in text
+    assert rc == 1  # non-zero exit because lines were skipped
+
+
+def test_apply_guard_skips_title_that_absorbed_context(tmp_path):
+    # Regression for the published incident (now structurally impossible, but
+    # belt-and-braces): if the read-only context ever lands on an entry line, the
+    # guard skips it and the marker keeps its label. A comment can never become a
+    # title, and nothing is truncated.
+    session = _session(tmp_path)
+    append_marker(session.markers_file, Marker(1, 10.0, "w", "manual", "Good Title"))
+    chapters_mod.run_chapters(session.folder, edit=True, out=lambda _m: None)
+    leaked = ('Able To Identify Kyogre review 02:09.2  raw 02:12.2  | '
+              '"You know what the Kyogre is. Oh, oh, oh, okay."')
+    _retitle(session, {"Good Title": leaked})
+
+    warnings = []
+    rc = chapters_mod.run_chapters(session.folder, apply=True, out=warnings.append)
+
+    assert _rows(session)[1]["label"] == "Good Title"  # unchanged, not corrupted
+    assert "absorbed the read-only context" in "\n".join(warnings)
+    assert rc == 1
+
+
+def test_apply_skips_implausibly_long_title(tmp_path):
+    # The length cap is a parse-failure heuristic (no context fingerprint here):
+    # skip + warn, never truncate what was typed.
+    session = _session(tmp_path)
+    append_marker(session.markers_file, Marker(1, 10.0, "w", "manual", "Short"))
+    chapters_mod.run_chapters(session.folder, edit=True, out=lambda _m: None)
+    _retitle(session, {"Short": ("Word " * 20).strip()})  # ~99 chars, no review/raw
+
+    warnings = []
+    rc = chapters_mod.run_chapters(session.folder, apply=True, out=warnings.append)
+
+    assert _rows(session)[1]["label"] == "Short"  # unchanged
+    assert "chars" in "\n".join(warnings) and rc == 1
+
+
+def test_apply_title_containing_hash_round_trips(tmp_path):
+    # A title may legitimately contain '#': it is the whole remainder of the entry
+    # line, so there is no delimiter to truncate it (the Q3 win).
+    session = _session(tmp_path)
+    append_marker(session.markers_file, Marker(1, 10.0, "w", "manual", "Episode Fifteen"))
+    chapters_mod.run_chapters(session.folder, edit=True, out=lambda _m: None)
+    _retitle(session, {"Episode Fifteen": "Episode #15"})
+
+    rc = chapters_mod.run_chapters(session.folder, apply=True, out=lambda _m: None)
+    assert _rows(session)[1]["label"] == "Episode #15"
+    assert rc == 0  # clean apply, no skips
+
+
+def test_edit_entry_lines_have_no_inline_comment(tmp_path):
+    # Structural proof the format changed: entry lines carry ONLY the title now;
+    # the '#'/context is on its own line. This is the root-cause fix.
+    session = _session(tmp_path)
+    _seed_chapters(session)
+    chapters_mod.run_chapters(session.folder, edit=True, out=lambda _m: None)
+    entry_lines = [
+        ln for ln in (session.folder / "chapters.txt").read_text(encoding="utf-8").splitlines()
+        if ln.startswith("[")
+    ]
+    assert entry_lines  # there are entries
+    for ln in entry_lines:
+        assert "#" not in ln  # no title/comment share a line anymore
+
+
+def test_apply_with_context_lines_deleted_still_applies(tmp_path):
+    # The '#' context lines are read-only decoration; deleting them all must not
+    # affect --apply (the reader skips '#' lines, so their absence is harmless).
+    session = _session(tmp_path)
+    append_marker(session.markers_file, Marker(1, 10.0, "w", "manual", "Alpha"))
+    append_marker(session.markers_file, Marker(2, 50.0, "w", "manual", "Beta"))
+    chapters_mod.run_chapters(session.folder, edit=True, out=lambda _m: None)
+    _retitle(session, {"Alpha": "Alpha New", "Beta": "Beta New"})
+    path = session.folder / "chapters.txt"
+    kept = [ln for ln in path.read_text(encoding="utf-8").splitlines()
+            if not ln.lstrip().startswith("#")]
+    path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+
+    rc = chapters_mod.run_chapters(session.folder, apply=True, out=lambda _m: None)
+    after = _rows(session)
+    assert after[1]["label"] == "Alpha New" and after[2]["label"] == "Beta New"
+    assert rc == 0
+
+
+def test_apply_reordered_entries_apply_by_index(tmp_path):
+    # File order is cosmetic; --apply matches by marker index, so reversing the
+    # whole file must still apply each title to the right marker.
+    session = _session(tmp_path)
+    append_marker(session.markers_file, Marker(1, 10.0, "w", "manual", "Alpha"))
+    append_marker(session.markers_file, Marker(2, 50.0, "w", "manual", "Beta"))
+    chapters_mod.run_chapters(session.folder, edit=True, out=lambda _m: None)
+    _retitle(session, {"Alpha": "Alpha New", "Beta": "Beta New"})
+    path = session.folder / "chapters.txt"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    path.write_text("\n".join(reversed(lines)) + "\n", encoding="utf-8")
+
+    chapters_mod.run_chapters(session.folder, apply=True, out=lambda _m: None)
+    after = _rows(session)
+    assert after[1]["label"] == "Alpha New" and after[2]["label"] == "Beta New"
+
+
+def test_apply_blanked_entry_title_is_never_applied_empty(tmp_path):
+    # Title deleted from the entry line (e.g. retyped onto the '#' line by
+    # mistake): the line no longer matches the entry shape, so it is skipped and
+    # the marker keeps its label. An empty title is never written.
+    session = _session(tmp_path)
+    append_marker(session.markers_file, Marker(1, 10.0, "w", "manual", "Original"))
+    chapters_mod.run_chapters(session.folder, edit=True, out=lambda _m: None)
+    path = session.folder / "chapters.txt"
+    text = re.sub(r"(?m)^(\[1@[-0-9.]+\]) Original$", r"\1", path.read_text(encoding="utf-8"))
+    path.write_text(text, encoding="utf-8")
+
+    warnings = []
+    rc = chapters_mod.run_chapters(session.folder, apply=True, out=warnings.append)
+    assert _rows(session)[1]["label"] == "Original"  # unchanged; never blanked
+    assert rc == 1  # a line was skipped
 
 
 def test_apply_refuses_stale_line_and_applies_valid_ones(tmp_path):
