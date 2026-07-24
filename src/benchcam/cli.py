@@ -33,6 +33,7 @@ from . import editor as editor_mod
 from . import keypress
 from . import label as label_mod
 from . import live as live_mod
+from . import merge as merge_mod
 from . import publish as publish_mod
 from . import session as session_mod
 from . import transcribe as transcribe_mod
@@ -41,6 +42,7 @@ from .chapters import ChaptersError
 from .dashboard import DashboardError
 from .editor import EditError
 from .label import LabelError
+from .merge import MergeError
 from .publish import PublishError
 from .recorders import get_recorder
 from .recorders.base import RecorderError
@@ -454,6 +456,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_pub.set_defaults(func=cmd_publish)
 
+    # merge
+    p_merge = sub.add_parser(
+        "merge",
+        help="Join two or more recorded sessions into one continuous merged session "
+        "(stream copy; offsets markers/mute-spans onto the joined timeline). The "
+        "sources are never modified; laptop-side.",
+    )
+    _add_root_arg(p_merge)
+    p_merge.add_argument(
+        "sessions",
+        nargs="+",
+        help="Two or more session ids/paths to join, in the ORDER they should play "
+        "(a warning names the mismatch if that is not chronological).",
+    )
+    p_merge.add_argument(
+        "--name",
+        default="",
+        help="Friendly name for the merged session (stored in session.json).",
+    )
+    p_merge.set_defaults(func=cmd_merge)
+
     # dashboard
     p_dash = sub.add_parser(
         "dashboard",
@@ -698,6 +721,13 @@ def cmd_publish(args: argparse.Namespace) -> int:
     return publish_mod.run_publish(session_dir)
 
 
+def cmd_merge(args: argparse.Namespace) -> int:
+    merge_mod.run_merge(
+        args.sessions, sessions_root=Path(args.sessions_root), name=args.name
+    )
+    return 0
+
+
 def cmd_dashboard(args: argparse.Namespace) -> int:
     # --lan is the explicit, deliberate way to expose on the LAN; it overrides
     # --host so a phone can reach the dashboard without remembering 0.0.0.0.
@@ -817,6 +847,7 @@ def main(argv: list[str] | None = None) -> int:
         AutochapterError,
         ChaptersError,
         PublishError,
+        MergeError,
     ) as exc:
         print(f"benchcam: {exc}", file=sys.stderr)
         return 1

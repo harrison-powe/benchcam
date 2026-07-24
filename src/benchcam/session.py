@@ -84,6 +84,14 @@ class Session:
     #: --capture-rate-mb-min'. Older session.json without these loads fine.
     min_session_minutes: float | None = None
     capture_rate_mb_per_min: float | None = None
+    #: Provenance for a session produced by 'benchcam merge': the source session
+    #: ids (in merge order) and each source's ffprobe duration (the applied
+    #: offsets are the running prefix sums of these). Empty for a captured session.
+    #: These MUST be dataclass fields, not loose json keys: from_dict drops unknown
+    #: keys and save() re-serializes only fields, so a loose key would silently
+    #: vanish on the next save. Old session.json without them loads fine (defaults).
+    merged_from: list[str] = field(default_factory=list)
+    merge_source_durations: list[float] = field(default_factory=list)
 
     @property
     def folder(self) -> Path:
