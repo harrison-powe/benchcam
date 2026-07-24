@@ -7,8 +7,12 @@ No real ffmpeg and no real camera are used: ``subprocess.Popen`` and
 from __future__ import annotations
 
 import collections
+import os
 import signal
 import subprocess
+import sys
+import time
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -506,6 +510,79 @@ def test_stop_via_pidfile_stale_pid_is_cleaned_up(tmp_path, monkeypatch):
 def test_stop_is_safe_when_never_started():
     rec = FfmpegRecorder()
     rec.stop()  # no process; must not raise
+
+
+def _wait_until_zombie(pid, timeout=5.0):
+    """Block until ``pid`` (a child of THIS process) is a zombie, without reaping.
+
+    Reads /proc state so we don't consume the child (os.waitpid would); the stop
+    path under test is what must reap it. Returns when state is 'Z' (or gone).
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            state = stat.rsplit(")", 1)[1].split()[0]  # field after "(comm)"
+        except OSError:
+            return  # already gone
+        if state == "Z":
+            return
+        time.sleep(0.02)
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="zombie reaping via /proc + waitpid is exercised on the Linux (Pi) path",
+)
+def test_stop_via_pidfile_reaps_own_zombie_child_without_lingering(tmp_path):
+    # REAL process, no mocks. A child of this process that has already exited is
+    # a zombie until reaped — exactly the daemon's situation (it parents ffmpeg
+    # and never reaps). The cross-process stop must REAP it: return promptly,
+    # remove the pidfile, and leave no <defunct>. Before the fix this polled the
+    # zombie as "alive" for 2xSTOP_TIMEOUT_SECONDS and left the corpse behind.
+    proc = subprocess.Popen([sys.executable, "-c", ""])  # exits immediately
+    _wait_until_zombie(proc.pid)
+    (tmp_path / PIDFILE_FILENAME).write_text(f"{proc.pid}\n", encoding="utf-8")
+
+    reaped = False
+    try:
+        start = time.monotonic()
+        FfmpegRecorder().stop(tmp_path)  # must reap the zombie and not raise
+        assert time.monotonic() - start < 2.0  # prompt: no 8s/16s poll
+        assert not (tmp_path / PIDFILE_FILENAME).exists()
+        # The zombie is gone: we (its parent) can no longer wait on it.
+        with pytest.raises(ChildProcessError):
+            os.waitpid(proc.pid, os.WNOHANG)
+        reaped = True
+    finally:
+        if not reaped:  # stop() didn't reap it — don't leak the zombie
+            try:
+                os.waitpid(proc.pid, os.WNOHANG)
+            except OSError:
+                pass
+
+
+def test_stop_via_pidfile_raises_when_process_survives_sigkill(tmp_path, monkeypatch):
+    # HONEST FAILURE: if the process is still alive after SIGKILL and the bounded
+    # window (a wedged/unkillable process), stop() must RAISE RecorderError, never
+    # falsely report success — and must PRESERVE the pidfile so a retry can still
+    # target the PID. We simulate an unkillable process: os.kill is a no-op, so
+    # the liveness probe never reports it gone; a bare (non-child) PID makes the
+    # reap fall through to that probe. Zero timeout keeps the test instant.
+    monkeypatch.setattr("benchcam.recorders.ffmpeg.sys.platform", "linux")
+    monkeypatch.setattr("benchcam.recorders.ffmpeg.STOP_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr("benchcam.recorders.ffmpeg.time.sleep", lambda _s: None)
+    monkeypatch.setattr(
+        "benchcam.recorders.ffmpeg.os.kill", lambda _pid, _sig: None  # never dies
+    )
+    (tmp_path / PIDFILE_FILENAME).write_text("4321\n", encoding="utf-8")
+
+    with pytest.raises(RecorderError) as exc:
+        FfmpegRecorder().stop(tmp_path)
+
+    assert "did not exit" in str(exc.value)
+    # Session-truth preserved: the pidfile survives for a retry.
+    assert (tmp_path / PIDFILE_FILENAME).exists()
 
 
 # --------------------------------------------------------------------------- #

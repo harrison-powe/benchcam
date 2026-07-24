@@ -582,9 +582,12 @@ class FfmpegRecorder(Recorder):
         pidfile = Path(folder) / PIDFILE_FILENAME
         pid = self._read_pid(pidfile)
         if pid is not None:
+            # Raises RecorderError if the process won't die within the bounded
+            # window. That propagates, deliberately SKIPPING the removal below, so
+            # the pidfile survives for a retry against a still-live capture.
             self._signal_pid_until_dead(pid)
-        # Clean up the pidfile whether we signaled, found it stale, or it was
-        # garbage — a leftover pidfile must never mislead a future stop.
+        # Reached only when the process is confirmed gone (or there was no PID):
+        # clean up the pidfile — a leftover must never mislead a future stop.
         self._remove_pidfile(folder)
 
     @staticmethod
@@ -601,23 +604,48 @@ class FfmpegRecorder(Recorder):
         return pid if pid > 0 else None
 
     def _signal_pid_until_dead(self, pid: int) -> None:
-        """SIGTERM, wait up to the timeout, then SIGKILL; block until gone.
+        """SIGTERM, wait up to the timeout, then SIGKILL and a BOUNDED wait.
+
+        Raises :class:`RecorderError` if the process is still alive after SIGKILL
+        and the bounded window — never falsely reports success. We deliberately do
+        NOT block forever: a process wedged in uninterruptible kernel sleep
+        (D-state, e.g. a hung V4L2 ioctl) can't be killed by any signal until the
+        kernel call returns, and blocking there would hang the caller too — in the
+        GPIO daemon that means the bench buttons go dead with no trace. A bounded
+        wait still lets a TRANSIENT wedge resolve (a slow ioctl that returns inside
+        the window succeeds); only a persistent one raises.
 
         PID-reuse is an accepted risk on this single-user bench appliance, so we
         signal the PID directly without extra identity checks.
         """
-        if not self._pid_alive(pid):
+        if self._pid_gone(pid):
             return
         self._send_signal(pid, signal.SIGTERM)
         if self._wait_pid_gone(pid, STOP_TIMEOUT_SECONDS):
             return
-        # Did not exit in time — force kill and block until it is gone.
+        # Did not exit in time — force kill, then a bounded wait (not forever).
         self._send_signal(pid, _SIGKILL)
-        self._wait_pid_gone(pid, STOP_TIMEOUT_SECONDS)
+        if self._wait_pid_gone(pid, STOP_TIMEOUT_SECONDS):
+            return
+        # Still alive after SIGKILL + the bounded window: report honestly. The
+        # caller leaves the session RUNNING (accurate — the capture may still be
+        # writing) and the pidfile is preserved (below) so a retry can find it.
+        raise RecorderError(
+            f"ffmpeg (pid {pid}) did not exit within {STOP_TIMEOUT_SECONDS:g}s "
+            "of SIGKILL; it appears wedged (uninterruptible kernel sleep?). The "
+            "session is left RUNNING and the capture may still be writing — "
+            "investigate that process before starting another."
+        )
 
     @staticmethod
     def _pid_alive(pid: int) -> bool:
-        """True if ``pid`` exists. Signal 0 only probes; it does not kill."""
+        """True if ``pid`` exists. Signal 0 only probes; it does not kill.
+
+        NOTE: this cannot distinguish a live process from a ZOMBIE — a dead but
+        unreaped child keeps its process-table entry, so ``os.kill(pid, 0)``
+        succeeds for a corpse. Use :meth:`_pid_gone` (which reaps our own child)
+        for liveness in the stop path; this is only the non-child fallback.
+        """
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
@@ -628,6 +656,38 @@ class FfmpegRecorder(Recorder):
             return False
         return True
 
+    @classmethod
+    def _pid_gone(cls, pid: int) -> bool:
+        """True if ``pid`` is gone — reaping it first if it is OUR child.
+
+        ``os.kill(pid, 0)`` reports a ZOMBIE (dead-but-unreaped child) as alive,
+        because its process-table entry lingers until the parent reaps it. That
+        is the GPIO-daemon defect: the daemon parents ffmpeg and never reaps, so
+        after ffmpeg dies promptly on SIGTERM, STOP polled the corpse as "alive"
+        for 2xSTOP_TIMEOUT_SECONDS (~16s) and left a ``<defunct>`` entry.
+
+        So attempt a non-blocking reap:
+        * our child, exited -> ``waitpid`` reaps it (no ``<defunct>`` lingers) and
+          reports it gone;
+        * our child, still running -> ``waitpid`` returns ``(0, 0)`` -> not gone;
+        * NOT our child (``ChildProcessError`` — the cross-process ``benchcam end``
+          case, where ffmpeg was orphaned to init, which reaps it) -> fall back to
+          the bare existence probe.
+
+        POSIX-only reaping (guarded on ``os.WNOHANG``); elsewhere the probe stands
+        in, preserving the existing Windows behavior.
+        """
+        if hasattr(os, "WNOHANG"):
+            try:
+                reaped, _status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                return not cls._pid_alive(pid)  # not our child; init reaps its zombie
+            except OSError:
+                return not cls._pid_alive(pid)  # defensive: fall back to the probe
+            # (pid, status) -> reaped and gone; (0, 0) -> our child still running.
+            return reaped != 0
+        return not cls._pid_alive(pid)
+
     @staticmethod
     def _send_signal(pid: int, sig: int) -> None:
         try:
@@ -637,10 +697,14 @@ class FfmpegRecorder(Recorder):
 
     @classmethod
     def _wait_pid_gone(cls, pid: int, timeout: float) -> bool:
-        """Poll until ``pid`` is gone or ``timeout`` elapses; True if gone."""
+        """Poll until ``pid`` is gone or ``timeout`` elapses; True if gone.
+
+        Uses the reap-aware :meth:`_pid_gone`, so a zombie of our own child is
+        reaped and recognized as gone immediately rather than polled as "alive".
+        """
         deadline = time.monotonic() + timeout
         while True:
-            if not cls._pid_alive(pid):
+            if cls._pid_gone(pid):
                 return True
             if time.monotonic() >= deadline:
                 return False
