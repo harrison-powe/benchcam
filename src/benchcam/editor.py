@@ -531,18 +531,24 @@ def write_chapters_json(
 def _escape_drawtext(text: str) -> str:
     r"""Escape label text for an ffmpeg drawtext ``text=`` value in a filtergraph.
 
-    The value passes through two parser levels (the filtergraph parser, then
-    drawtext's own ``:``-separated option parser), so characters special to
-    either level must survive both:
+    The value passes through two ``av_get_token`` parser levels (the filtergraph
+    tokenizer, then the option-value parser), so characters special to either
+    level must survive BOTH:
 
-    - ``\`` -> ``\\\\`` (literal backslash)
-    - ``:`` -> ``\\:``   (drawtext option separator)
-    - ``'`` -> ``\'``    (filtergraph quote)
-    - ``,`` ``;`` ``[`` ``]`` -> ``\<char>`` (filtergraph separators / pad refs)
-    - ``%`` -> ``\%``    (drawtext text expansion; we also pass expansion=none)
+    - ``\`` -> ``\\\\``  (escape char at both levels)
+    - ``'`` -> ``\\\'``  (quote char at both levels; anything less leaves a bare
+      quote at level 2, which opens an unterminated quoted region that swallows
+      the rest of the drawtext options into the on-screen text)
+    - ``:`` -> ``\\:``   (option separator; special at level 2 only, but its
+      backslash needs doubling to survive level 1)
+    - ``,`` ``;`` ``[`` ``]`` -> ``\<char>`` (graph separators; level 1 only)
+    - ``%`` -> ``\%``    (redundant belt-and-braces: expansion=none already
+      keeps drawtext expansion off)
 
-    Verified against ffmpeg by rendering labels like ``it's 3:00`` and
-    ``path C:\\tmp``.
+    Frame-verified on a real render (extracted-frame inspection of a preview
+    encode) for labels covering: a single apostrophe, multiple apostrophes,
+    apostrophe+colon combined, backslash+colon paths, comma/semicolon/brackets,
+    and literal ``%``/``{}`` under expansion=none.
     """
     text = text.replace("\r", " ").replace("\n", " ")
     out: list[str] = []
@@ -552,7 +558,7 @@ def _escape_drawtext(text: str) -> str:
         elif ch == ":":
             out.append("\\\\:")
         elif ch == "'":
-            out.append("\\'")
+            out.append("\\\\\\'")
         elif ch in ",;[]":
             out.append("\\" + ch)
         elif ch == "%":

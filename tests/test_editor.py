@@ -380,11 +380,15 @@ def test_escape_fontfile_windows_path():
 
 
 def test_escape_drawtext_colon():
-    assert _escape_drawtext("it's 3:00") == r"it\'s 3\\:00"
+    assert _escape_drawtext("it's 3:00") == r"it\\\'s 3\\:00"
 
 
 def test_escape_drawtext_apostrophe():
-    assert _escape_drawtext("don't") == r"don\'t"
+    # The quote char is special at BOTH av_get_token levels, so it needs the
+    # full \\\' form. The old \' form left a bare level-2 quote that swallowed
+    # the rest of the drawtext options into the rendered text (real incident:
+    # filter syntax burned into a published frame).
+    assert _escape_drawtext("don't") == r"don\\\'t"
 
 
 def test_escape_drawtext_comma():
@@ -533,7 +537,63 @@ def test_filtergraph_escapes_tricky_label():
                 captions=[editor_mod.Caption("it's 3:00", 0.0, 8.0)]),
     ]
     fc = build_filter_complex(plan)
-    assert r"text=it\'s 3\\:00" in fc
+    assert r"text=it\\\'s 3\\:00" in fc
+
+
+# --------------------------------------------------------------------------- #
+# Escaping round-trip: REGRESSION GUARD, NOT ACCEPTANCE EVIDENCE.
+#
+# _unescape_once below is a MODEL of ffmpeg's av_get_token, and this test is
+# only as trustworthy as that model. The current escaper bug shipped exactly
+# this way: the escape levels were reasoned about, the test asserted the
+# reasoning (don't -> don\'t), and the reasoning was wrong — while real
+# renders burned filter syntax into the frame. The acceptance evidence for
+# escaping changes is extracted FRAMES from a real render; this test exists
+# only to catch future regressions against the fixed form.
+# --------------------------------------------------------------------------- #
+
+def _unescape_once(s: str) -> str:
+    """One av_get_token-style pass: backslash escapes; single quotes quote."""
+    out = []
+    quoted = False
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch == "\\" and i + 1 < len(s):
+            out.append(s[i + 1])
+            i += 2
+        elif ch == "'":
+            quoted = not quoted
+            i += 1
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def test_escape_drawtext_survives_two_unescape_levels():
+    nasty = [
+        "Won't Grip",
+        "Don't Trust 'Auto'",
+        "Won't Hold 3:1",
+        r"Path C:\tmp\x",
+        "Comma, Semi; Bracket [v]",
+        "100% Sure {x}",
+        "Plain Control Label",
+    ]
+    for label in nasty:
+        escaped = _escape_drawtext(label)
+        # % is escaped only as belt-and-braces for drawtext expansion (which is
+        # off); the parser model passes the backslash-consumed % through as-is.
+        assert _unescape_once(_unescape_once(escaped)) == label
+
+
+def test_escape_drawtext_is_identity_for_plain_labels():
+    # Style invariant: a label with no special characters must escape to
+    # itself, so the generated filterscript — and therefore the render — is
+    # byte-identical to the pre-fix output for unaffected sessions.
+    for label in ("Plain Control Label", "Data Collection Begins", "01 Power"):
+        assert _escape_drawtext(label) == label
 
 
 def test_every_audio_segment_pins_an_explicit_sample_format():
