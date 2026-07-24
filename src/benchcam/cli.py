@@ -263,6 +263,14 @@ def build_parser() -> argparse.ArgumentParser:
         "existing labels are always preserved.",
     )
     p_edit.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Refused with guidance: edit itself never overwrites anything. "
+        "Without this guard, argparse silently expands --overwrite to "
+        "--overwrite-auto (prefix match). Use --overwrite-auto to regenerate "
+        "chapters, or 'transcribe/label --overwrite' to replace narration/labels.",
+    )
+    p_edit.add_argument(
         "--preview",
         action="store_true",
         help="Fast, low-quality render (720p, ultrafast) to review.preview.mp4 for "
@@ -427,6 +435,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Session id or folder path (default: newest session).",
     )
+    p_chap.add_argument(
+        "--session",
+        dest="session_opt",
+        default=None,
+        help="Same as the positional session (the flag form every other command "
+        "uses); give one or the other, not both. Also closes the silent "
+        "'--session' -> '--sessions-root' prefix expansion.",
+    )
     chap_mode = p_chap.add_mutually_exclusive_group()
     chap_mode.add_argument(
         "--edit",
@@ -453,6 +469,14 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         default=None,
         help="Session id or folder path (default: newest session).",
+    )
+    p_pub.add_argument(
+        "--session",
+        dest="session_opt",
+        default=None,
+        help="Same as the positional session (the flag form every other command "
+        "uses); give one or the other, not both. Also closes the silent "
+        "'--session' -> '--sessions-root' prefix expansion.",
     )
     p_pub.set_defaults(func=cmd_publish)
 
@@ -598,7 +622,34 @@ def cmd_live(args: argparse.Namespace) -> int:
     )
 
 
+def _one_session_arg(args: argparse.Namespace) -> str | None:
+    """The session from the positional or ``--session``, refusing both.
+
+    chapters/publish accept the session positionally (the original form) and as
+    ``--session`` (the flag form every other command uses). Giving both is an
+    error — even when the two values are equal — so there is never a silent
+    precedence rule.
+    """
+    positional = getattr(args, "session", None)
+    flagged = getattr(args, "session_opt", None)
+    if positional is not None and flagged is not None:
+        raise EditError(
+            "give the session once - positionally or with --session, not both."
+        )
+    return flagged if flagged is not None else positional
+
+
 def cmd_edit(args: argparse.Namespace) -> int:
+    # Guard option (see the prefix-collision register in tests/test_cli.py):
+    # --overwrite is transcribe/label vocabulary; without a real option here,
+    # argparse silently expands it to --overwrite-auto and triggers an
+    # unrequested Whisper pass + chapter regeneration.
+    if args.overwrite:
+        raise EditError(
+            "edit has no --overwrite. Did you mean --overwrite-auto (regenerate "
+            "the auto chapters from one fresh Whisper pass)? 'transcribe "
+            "--overwrite' replaces narration; 'label --overwrite' replaces labels."
+        )
     # --fetch: pull the session from the Pi first if it's not already local, then
     # edit as normal. CLI-layer orchestration (like --auto), never in run_edit;
     # reuses fetch's _transfer_session (no scp reimplementation) and deliberately
@@ -707,7 +758,7 @@ def cmd_autochapter(args: argparse.Namespace) -> int:
 
 def cmd_chapters(args: argparse.Namespace) -> int:
     session_dir = editor_mod.resolve_session_dir(
-        Path(args.sessions_root), args.session
+        Path(args.sessions_root), _one_session_arg(args)
     )
     return chapters_mod.run_chapters(
         session_dir, edit=args.edit, apply=args.apply
@@ -716,7 +767,7 @@ def cmd_chapters(args: argparse.Namespace) -> int:
 
 def cmd_publish(args: argparse.Namespace) -> int:
     session_dir = editor_mod.resolve_session_dir(
-        Path(args.sessions_root), args.session
+        Path(args.sessions_root), _one_session_arg(args)
     )
     return publish_mod.run_publish(session_dir)
 
