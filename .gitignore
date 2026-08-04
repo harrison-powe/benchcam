@@ -26,3 +26,5 @@ sessions/
 *.png
 *.jpg
 *.jpeg
+_trash/
+*.bak-*
