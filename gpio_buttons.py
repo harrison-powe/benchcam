@@ -312,18 +312,52 @@ def _load_fonts():
         _font_big = _font_small = ImageFont.load_default()
 
 
+def _release_oled(device):
+    """Close a luma device's I2C fd. NOTHING ELSE WILL — do not remove.
+
+    luma closes the bus only in cleanup(); neither luma's i2c nor smbus2.SMBus
+    defines __del__, and the fd is a raw os.open() int, so dropping the last
+    reference leaks it for the life of the process.
+
+    persist=True is deliberate: luma's cleanup() is `if not persist: hide();
+    clear()` followed by the serial close. On an already-dead panel hide()
+    raises, which would skip the serial close underneath and leave the fd leaked
+    anyway — exactly the case this is called in.
+    """
+    if device is None:
+        return
+    try:
+        device.persist = True
+        device.cleanup()
+    except Exception:  # noqa: BLE001 - releasing must never raise
+        pass
+
+
 def _init_oled():
-    """Construct the SSD1306, or return None if it can't be reached. Never raises."""
+    """Construct the SSD1306, or return None if it can't be reached. Never raises.
+
+    The serial interface is held in a local so the FAILURE path can close it.
+    luma's i2c opens /dev/i2c-N in __init__ and does NOT probe the address, so
+    construction succeeds even with nothing on the bus; the NACK only surfaces
+    inside ssd1306(), by which point the bus is already open. Without the
+    cleanup below, every failed retry leaked one fd until the 1024-fd limit was
+    hit, after which /dev/i2c-N could not be opened AT ALL and the 30s retry
+    could never recover — silently, since logging is transition-only.
+    """
     if not _OLED_IMPORTS_OK:
         return None
+    serial = None
     try:
-        device = ssd1306(
-            i2c(port=OLED_PORT, address=OLED_ADDRESS),
-            width=OLED_WIDTH, height=OLED_HEIGHT,
-        )
+        serial = i2c(port=OLED_PORT, address=OLED_ADDRESS)
+        device = ssd1306(serial, width=OLED_WIDTH, height=OLED_HEIGHT)
         _load_fonts()
-        return device
+        return device  # the device owns `serial` now — must NOT be cleaned up
     except Exception:  # noqa: BLE001 - unplugged/absent module is not fatal
+        if serial is not None:
+            try:
+                serial.cleanup()  # i2c.cleanup() -> self._bus.close()
+            except Exception:  # noqa: BLE001
+                pass
         return None
 
 
@@ -401,6 +435,11 @@ def _display_loop():
                     _oled_failing = False
                     print("[gpio] OLED recovered.")
         except Exception as e:  # noqa: BLE001 - display faults are never fatal
+            # Release before dropping the reference: a device that worked and
+            # then failed mid-flight (yanked jumper) still holds an open I2C fd,
+            # and nothing else closes it. Without this, one live failure plus the
+            # retries after it leak an fd apiece toward the 1024 limit.
+            _release_oled(_oled)
             _oled = None
             _oled_last_attempt = time.monotonic()
             if not _oled_failing:
