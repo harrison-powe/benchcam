@@ -12,13 +12,16 @@ clip that timelapses the boring parts and slows down around each marker.
 > **Status:** v0, now exercised on **real bench sessions**. Two real
 > `hello-motion` sessions exist — a connection-debugging session and one where the
 > actuator was recorded **spinning on command** (open-loop bring-up, narrated on
-> camera). The capture path, the physical **START/MARK/STOP/MUTE** buttons + status
-> LED, and the full post-capture pipeline (transcribe → auto-chapter → speech-aware
-> review clip) have all run on real footage. Honest caveats: the physical controls
-> are still a **breadboard** rig (**no custom PCB yet**), the actuator sessions were
-> bring-up/debugging rather than a polished showcase, and raw capture still records
-> to a **microSD** until the external SSD is deployed. Treat it as an early, working
-> tool, not a finished product.
+> camera). The capture path, the physical **START/MARK/STOP/MUTE** buttons with
+> their record/mute LEDs and OLED status panel, and the full post-capture pipeline
+> (transcribe → auto-chapter → speech-aware review clip) have all run on real
+> footage. Honest caveats: the physical controls still run on the **breadboard**
+> rig — a v1 control PCB is built and electrically verified but has **never
+> successfully driven anything**
+> (see [The v1 control PCB](#the-v1-control-pcb-built-and-verified-not-yet-working)) —
+> the actuator sessions were bring-up/debugging rather than a polished showcase,
+> and raw capture still records to a **microSD** until the external SSD is
+> deployed. Treat it as an early, working tool, not a finished product.
 
 ## What BenchCam is (and is not)
 
@@ -33,10 +36,12 @@ clip that timelapses the boring parts and slows down around each marker.
   It uses off-the-shelf cameras and compute (a USB webcam, a Raspberry Pi) and
   does **not** build a camera, capture card, image sensor, or high-speed video
   electronics. It **does** have physical controls — tactile START/MARK/STOP/MUTE
-  buttons and a status LED wired to the Pi's GPIO (a **breadboard** rig today; no
-  custom PCB yet) — but it stays strictly on the **observation** side: it records
-  and marks hardware work and **never drives actuators or any moving hardware**
-  (it may *receive* external marker events, but never commands hardware).
+  buttons, record/mute status LEDs, and a small I²C status display wired to the
+  Pi's GPIO — and it switches **one bench ring light** (an illumination load, through
+  a low-side MOSFET) so the light follows the recording. That is the entire extent
+  of what it drives: it stays on the **observation** side and **never commands
+  actuators or any moving hardware** (it may *receive* external marker events, but
+  never commands motion).
 
 v0 ships with a **NullRecorder** (records no video) so you can use and test the
 session + marker workflow immediately, with or without a camera. The
@@ -67,15 +72,66 @@ The heavy, torch-based extras (`[transcribe]`, `[vad]`) and the `[label]` extra 
 
 ### Physical controls (GPIO)
 
-Four tactile buttons and a status LED wire to the Pi's 40-pin header (3.3V logic
-only): **START**, **MARK**, **STOP**, and **MUTE**, plus a **status LED** (through
-a ≥220Ω series resistor) that shows mute state. A small Pi-local daemon
-(`gpio_buttons.py`, intentionally **not** tracked in this repo) debounces the
-presses and calls the same session/marker code the CLI uses — START begins a
-recording, MARK drops a frame-accurate `source=gpio` marker, STOP finalizes, and
-MUTE marks a span to be timelapsed out of the review. It runs as the always-on
-`benchcam-buttons` service. This is a **breadboard** rig, validated in real
-sessions — **not** a custom PCB.
+Four tactile buttons, two status LEDs, an I²C status display, and one switched
+bench light wire to the Pi's 40-pin header (3.3V logic only):
+
+| Function | GPIO | What it does |
+| --- | --- | --- |
+| **START** | 27 | create a session and start recording |
+| **MARK** | 17 | drop a frame-accurate `source=gpio` marker |
+| **STOP** | 22 | stop recording and end the session |
+| **MUTE** | 23 | toggle a mute span (force-timelapsed out of the review) |
+| record LED | 5 | lit while a session is RUNNING |
+| mute LED | 24 | lit while a mute span is open |
+| ring light | 6 | bench light through an IRLZ44N low-side MOSFET; on while RUNNING |
+| OLED | I²C-1 | SSD1306 128×64 at `0x3C`: elapsed, marker count, mute badge, free space |
+
+The Pi-local daemon [gpio_buttons.py](gpio_buttons.py) debounces the presses and
+calls the same session/marker code the CLI uses, so button-driven and CLI-driven
+sessions are cross-process safe. It runs as the always-on `benchcam-buttons`
+service. Everything below is validated on the **breadboard** rig:
+
+- The **record LED** is derived from the on-disk session state rather than
+  in-memory state, so it stays correct across a daemon restart.
+- The **status display** shows elapsed time, marker count, a mute badge, and free
+  space with a low-space flag — measured against the same pre-flight floor the
+  recorder enforces, so the panel can never show a healthy number while START
+  would refuse. It refreshes on a background thread, fails soft (no display fault
+  can affect capture), and retries a lost panel every 30s.
+- **SIGTERM/SIGINT** clears both LEDs and the panel, so a stopped daemon never
+  leaves a lit record light or a frozen `●REC` frame on the bench.
+- **Mute spans survive a daemon restart** via a session-local sidecar
+  (`mute_open.json`) that holds only the currently-open span. `mute_spans.csv`
+  itself stays append-only and complete-rows-only, so the renderer never sees a
+  half-written span and mistakes it for one running to end-of-session.
+- The **ring light** follows the recording through the MOSFET. The circuit is
+  validated, but the light currently on the bench has a capacitive touch switch
+  that resets on power loss — so the MOSFET can turn it off and never back on.
+  Blocked on swapping in a light with a mechanical switch, not on hardware or code.
+
+### The v1 control PCB (built and verified, not yet working)
+
+A single-sided control board was designed and CNC-milled in-house from the KiCad
+project in [control-board/](control-board/): 100 × 80 mm FR-1, four buttons,
+record/mute LEDs, a 4-pin I²C header for the OLED, an IRLZ44N low-side MOSFET on
+a screw terminal for the bench light, and a 2×20 IDC ribbon to the Pi header.
+Designed 2026-07-18, milled 07-19, continuity-verified 07-26, fully soldered and
+metered 08-02. Because it was milled rather than fabbed, the gerbers and mill
+gcode are tracked alongside the design as the reproduction record.
+
+**It has never successfully driven anything.** First bring-up crashed the Pi
+twice, and a J1 ground path is intermittent; diagnosis is ongoing. The
+**breadboard rig remains the live control surface** for every session.
+
+As-built deltas, recorded so future debugging doesn't chase them:
+
+- **R3 is 220Ω on the board, not the 150Ω in the schematic** (MOSFET gate series
+  resistor). The schematic deliberately keeps the designed value.
+- A deliberate **solder bridge spans R3 pad 2 to R4 pad 1** — both are already on
+  the gate net; it repairs a trace broken during rework. It is a repair, not a
+  design change, and a re-mill would not reproduce it.
+- **Only the J1 pins that carry a net are soldered** (21 of 40); the other 19 are
+  unconnected in the netlist.
 
 ## Requirements
 
@@ -749,6 +805,10 @@ scripts/
     benchcam-dashboard.vbs   no-console Windows launcher (recommended; pinnable)
     benchcam-dashboard.bat   Windows launcher (keeps a console window)
     benchcam-dashboard.ps1   PowerShell launcher
+control-board/        v1 control PCB: KiCad source + the gerbers/mill gcode it
+                      was cut from (built and verified, NOT yet working)
+gpio_buttons.py       Pi-only GPIO daemon: buttons, record/mute LEDs, OLED
+                      status panel, mute spans, ring light
 reviewer.py           laptop review hub (list / open / watch / make-review)
 tests/                unit tests
 ```
