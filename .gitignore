@@ -46,3 +46,11 @@ fp-info-cache
 _autosave-*
 *.lck
 ~*.lck
+
+# ...but board photos under control-board/ ARE tracked. The media ignores above
+# exist to keep session captures out of git; a milled board is documented by
+# pictures as much as by files, and this repo is the build log for it. Negations
+# must follow the *.png/*.jpg rules they override.
+!control-board/**/*.png
+!control-board/**/*.jpg
+!control-board/**/*.jpeg
