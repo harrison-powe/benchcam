@@ -28,3 +28,21 @@ sessions/
 *.jpeg
 _trash/
 *.bak-*
+
+# KiCad: editor/tool state and backups, never design source. The design files,
+# gerbers and mill gcode under control-board/ ARE tracked (see the README) -
+# this board was milled from those exact files and cannot be re-ordered from a
+# fab, so they are the reproduction record.
+#
+# KiCad Local History and restore snapshots each contain their own nested .git,
+# which git would otherwise try to record as a broken gitlink.
+.history/
+_restore_backup_*/
+*-backups/
+fp-info-cache
+# Per-user window/UI state (NOT project settings - .kicad_pro is tracked).
+*.kicad_prl
+*.kicad_*-bak
+_autosave-*
+*.lck
+~*.lck

@@ -1,0 +1,23 @@
+G04 #@! TF.GenerationSoftware,KiCad,Pcbnew,10.0.4*
+G04 #@! TF.CreationDate,2026-07-18T18:47:56-07:00*
+G04 #@! TF.ProjectId,benchcam-control-board,62656e63-6863-4616-9d2d-636f6e74726f,rev?*
+G04 #@! TF.SameCoordinates,Original*
+G04 #@! TF.FileFunction,Profile,NP*
+%FSLAX46Y46*%
+G04 Gerber Fmt 4.6, Leading zero omitted, Abs format (unit mm)*
+G04 Created by KiCad (PCBNEW 10.0.4) date 2026-07-18 18:47:56*
+%MOMM*%
+%LPD*%
+G01*
+G04 APERTURE LIST*
+G04 #@! TA.AperFunction,Profile*
+%ADD10C,0.050000*%
+G04 #@! TD*
+G04 APERTURE END LIST*
+D10*
+X48465000Y-50000000D02*
+X148465000Y-50000000D01*
+X148465000Y-130000000D01*
+X48465000Y-130000000D01*
+X48465000Y-50000000D01*
+M02*
